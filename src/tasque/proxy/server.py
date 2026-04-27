@@ -36,7 +36,10 @@ DEFAULT_PORT = 3456
 DEFAULT_MAX_CONCURRENT = 4
 HEALTHZ_CACHE_SECONDS = 30
 LOG_RETENTION_SECONDS = 7 * 24 * 60 * 60
-PROMPT_STDIN_THRESHOLD = 100 * 1024  # bytes
+# Keep below the Windows CreateProcess command-line cap (~32,767 chars) with
+# headroom for the rest of argv and the env block. Larger prompts are piped
+# via stdin instead of `-p`.
+PROMPT_STDIN_THRESHOLD = 8 * 1024  # bytes
 
 
 class ProxyError(Exception):
