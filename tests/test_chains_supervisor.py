@@ -1,0 +1,306 @@
+"""Tests for the supervisor: reconcile, fan-out materialization, replan
+routing, and the None-clears-failure reducer."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from langgraph.graph import END
+
+from tasque.chains.graph._common import _merge_failures
+from tasque.chains.graph.supervisor import (
+    APPROVAL_NODE,
+    PLANNER_NODE,
+    WORKER_NODE,
+    _route_from_supervisor,
+    supervisor,
+)
+from tasque.chains.spec import PlanNode
+
+
+def _node(**kwargs: Any) -> PlanNode:
+    base: dict[str, Any] = {
+        "id": "x",
+        "kind": "worker",
+        "directive": "do",
+        "depends_on": [],
+        "consumes": [],
+        "fan_out_on": None,
+        "status": "pending",
+        "origin": "spec",
+        "on_failure": "halt",
+        "failure_reason": None,
+        "fan_out_index": None,
+        "fan_out_item": None,
+        "tier": "haiku",
+    }
+    base.update(kwargs)
+    # Approval steps must NOT carry a tier — the supervisor doesn't
+    # use it for them and the validator rejects it.
+    if base.get("kind") == "approval":
+        base["tier"] = None
+    return base  # type: ignore[return-value]
+
+
+# ----------------------------------------------------------- _merge_failures
+
+def test_merge_failures_none_on_right_clears_key() -> None:
+    left = {"a": "boom", "b": "kapow"}
+    right = {"a": None}
+    out = _merge_failures(left, right)
+    assert out == {"b": "kapow"}
+
+
+def test_merge_failures_naive_merge_would_keep_old() -> None:
+    """Sanity-check that {**left, **right} would NOT clear the key — this is
+    the bug the contract calls out. ``_merge_failures`` must do better."""
+    naive = {**{"a": "boom"}, **{"a": None}}
+    assert naive == {"a": None}  # still present, not cleared
+    out = _merge_failures({"a": "boom"}, {"a": None})
+    assert "a" not in out
+
+
+def test_merge_failures_right_value_wins_for_non_none() -> None:
+    out = _merge_failures({"a": "old"}, {"a": "new"})
+    assert out == {"a": "new"}
+
+
+# ----------------------------------------------------------- supervisor
+
+def test_supervisor_promotes_pending_to_running_when_deps_clear() -> None:
+    plan = [
+        _node(id="a"),
+        _node(id="b", depends_on=["a"], consumes=["a"]),
+    ]
+    update = supervisor({"plan": plan, "completed": {}, "failures": {}})
+    new_plan = update["plan"]
+    statuses = {n["id"]: n["status"] for n in new_plan}
+    assert statuses["a"] == "running"
+    assert statuses["b"] == "pending"
+
+
+def test_supervisor_reconciles_running_completed_step() -> None:
+    plan = [_node(id="a", status="running")]
+    completed = {"a": {"report": "done", "produces": {}}}
+    update = supervisor({"plan": plan, "completed": completed, "failures": {}})
+    statuses = {n["id"]: n["status"] for n in update["plan"]}
+    assert statuses["a"] == "completed"
+
+
+def test_supervisor_reconciles_running_failed_step_sets_failure_reason() -> None:
+    plan = [_node(id="a", status="running")]
+    failures = {"a": "kaboom"}
+    update = supervisor({"plan": plan, "completed": {}, "failures": failures})
+    a = next(n for n in update["plan"] if n["id"] == "a")
+    assert a["status"] == "failed"
+    assert a["failure_reason"] == "kaboom"
+
+
+def test_supervisor_sets_replan_when_failed_step_has_replan() -> None:
+    plan = [_node(id="a", status="running", on_failure="replan")]
+    failures = {"a": "boom"}
+    update = supervisor({"plan": plan, "completed": {}, "failures": failures})
+    assert update.get("replan") is True
+
+
+def test_supervisor_materializes_fan_out_with_good_list() -> None:
+    plan = [
+        _node(id="scan", status="completed"),
+        _node(
+            id="filter",
+            kind="worker",
+            depends_on=["scan"],
+            consumes=["scan"],
+            fan_out_on="items",
+        ),
+    ]
+    completed = {"scan": {"report": "ok", "produces": {"items": ["x", "y"]}}}
+    update = supervisor({"plan": plan, "completed": completed, "failures": {}})
+    new_plan = update["plan"]
+    ids = sorted(n["id"] for n in new_plan)
+    assert ids == ["filter", "filter[0]", "filter[1]", "scan"]
+    f0 = next(n for n in new_plan if n["id"] == "filter[0]")
+    assert f0["fan_out_index"] == 0
+    assert f0["fan_out_item"] == "x"
+    assert f0["fan_out_on"] is None
+    template = next(n for n in new_plan if n["id"] == "filter")
+    assert template["status"] == "completed"
+
+
+def test_supervisor_completes_template_on_empty_fan_out_list() -> None:
+    """An empty list from upstream is a legitimate "nothing to do"
+    outcome — the template completes with zero children rather than
+    halting the chain."""
+    plan = [
+        _node(id="scan", status="completed"),
+        _node(
+            id="filter",
+            depends_on=["scan"],
+            consumes=["scan"],
+            fan_out_on="items",
+        ),
+    ]
+    completed = {"scan": {"report": "ok", "produces": {"items": []}}}
+    update = supervisor({"plan": plan, "completed": completed, "failures": {}})
+    template = next(n for n in update["plan"] if n["id"] == "filter")
+    assert template["status"] == "completed"
+    # No fan-out children materialised.
+    children = [n for n in update["plan"] if n["id"].startswith("filter[")]
+    assert children == []
+    # And no failure was synthesised.
+    assert "failures" not in update or "filter" not in (update.get("failures") or {})
+
+
+def test_supervisor_promotes_downstream_after_empty_fan_out() -> None:
+    """After an empty fan-out completes, a downstream step that
+    ``consumes`` the template should be promoted to running and
+    receive ``[]`` for that dep — same shape it would see for a
+    non-empty fan-out, just empty."""
+    from tasque.chains.graph.supervisor import _gather_consumes_payload
+
+    plan = [
+        _node(id="scan", status="completed"),
+        _node(
+            id="filter",
+            depends_on=["scan"],
+            consumes=["scan"],
+            fan_out_on="items",
+        ),
+        _node(
+            id="apply",
+            depends_on=["filter"],
+            consumes=["filter"],
+        ),
+    ]
+    completed = {"scan": {"report": "ok", "produces": {"items": []}}}
+    update = supervisor({"plan": plan, "completed": completed, "failures": {}})
+    new_plan = update["plan"]
+    apply_node = next(n for n in new_plan if n["id"] == "apply")
+    # Deps satisfied (filter completed with zero children) → promoted.
+    assert apply_node["status"] == "running"
+    payload = _gather_consumes_payload(new_plan, apply_node, completed)
+    assert payload == {"filter": []}
+
+
+def test_supervisor_fails_template_on_non_list_fan_out() -> None:
+    plan = [
+        _node(id="scan", status="completed"),
+        _node(
+            id="filter",
+            depends_on=["scan"],
+            consumes=["scan"],
+            fan_out_on="items",
+        ),
+    ]
+    completed = {"scan": {"report": "ok", "produces": {"items": "nope"}}}
+    update = supervisor({"plan": plan, "completed": completed, "failures": {}})
+    template = next(n for n in update["plan"] if n["id"] == "filter")
+    assert template["status"] == "failed"
+    assert "not a list" in (template["failure_reason"] or "")
+
+
+def test_supervisor_fails_template_when_fan_out_dep_not_in_consumes() -> None:
+    plan = [
+        _node(id="scan", status="completed"),
+        _node(
+            id="filter",
+            depends_on=["scan"],
+            consumes=[],
+            fan_out_on="items",
+        ),
+    ]
+    completed = {"scan": {"report": "ok", "produces": {"items": ["x"]}}}
+    update = supervisor({"plan": plan, "completed": completed, "failures": {}})
+    template = next(n for n in update["plan"] if n["id"] == "filter")
+    assert template["status"] == "failed"
+
+
+def test_supervisor_waits_on_fan_out_children_before_promoting_downstream() -> None:
+    plan = [
+        _node(id="scan", status="completed"),
+        _node(
+            id="filter",
+            depends_on=["scan"],
+            consumes=["scan"],
+            fan_out_on="items",
+        ),
+        _node(id="notify", depends_on=["filter"], consumes=["filter"]),
+    ]
+    completed = {"scan": {"report": "ok", "produces": {"items": ["x", "y"]}}}
+    update = supervisor({"plan": plan, "completed": completed, "failures": {}})
+    notify = next(n for n in update["plan"] if n["id"] == "notify")
+    # Children just materialized, not yet completed → notify must wait.
+    assert notify["status"] == "pending"
+
+
+def test_supervisor_promotes_downstream_after_all_fan_out_children_completed() -> None:
+    plan = [
+        _node(id="scan", status="completed"),
+        _node(
+            id="filter",
+            depends_on=["scan"],
+            consumes=["scan"],
+            fan_out_on="items",
+            status="completed",
+        ),
+        _node(
+            id="filter[0]",
+            depends_on=["scan"],
+            consumes=["scan"],
+            fan_out_on=None,
+            fan_out_index=0,
+            fan_out_item="x",
+            status="completed",
+        ),
+        _node(
+            id="filter[1]",
+            depends_on=["scan"],
+            consumes=["scan"],
+            fan_out_on=None,
+            fan_out_index=1,
+            fan_out_item="y",
+            status="completed",
+        ),
+        _node(id="notify", depends_on=["filter"], consumes=["filter"]),
+    ]
+    completed = {
+        "scan": {"report": "ok", "produces": {"items": ["x", "y"]}},
+        "filter[0]": {"report": "ok", "produces": {"framing": "X"}},
+        "filter[1]": {"report": "ok", "produces": {"framing": "Y"}},
+    }
+    update = supervisor({"plan": plan, "completed": completed, "failures": {}})
+    notify = next(n for n in update["plan"] if n["id"] == "notify")
+    assert notify["status"] == "running"
+
+
+# ----------------------------------------------------------- routing
+
+def test_route_from_supervisor_routes_to_planner_on_replan() -> None:
+    plan = [_node(id="a", status="failed")]
+    target = _route_from_supervisor({"plan": plan, "replan": True})
+    assert target == PLANNER_NODE
+
+
+def test_route_from_supervisor_dispatches_running_workers() -> None:
+    plan = [
+        _node(id="a", status="running"),
+        _node(id="b", status="pending"),
+    ]
+    target = _route_from_supervisor({"plan": plan, "completed": {}, "failures": {}})
+    assert isinstance(target, list)
+    assert len(target) == 1
+    assert target[0].node == WORKER_NODE
+
+
+def test_route_from_supervisor_dispatches_running_approvals() -> None:
+    plan = [_node(id="a", kind="approval", status="running")]
+    target = _route_from_supervisor({"plan": plan, "completed": {}, "failures": {}})
+    assert isinstance(target, list)
+    assert len(target) == 1
+    assert target[0].node == APPROVAL_NODE
+
+
+def test_route_from_supervisor_ends_when_nothing_in_flight() -> None:
+    plan = [_node(id="a", status="completed")]
+    target = _route_from_supervisor({"plan": plan, "completed": {}, "failures": {}})
+    assert target == END

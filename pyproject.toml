@@ -1,0 +1,82 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tasque"
+version = "1.0.0"
+description = "Single-user task-orchestration daemon"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { file = "LICENSE" }
+authors = [{ name = "Tyler Flar" }]
+dependencies = [
+    "sqlalchemy>=2.0",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    "typer>=0.12",
+    "structlog>=24.1",
+    "python-dotenv>=1.0",
+    "langgraph>=0.2",
+    "langchain-core>=0.3",
+    "langchain-openai>=0.2",
+    "apscheduler>=3.11.2",
+    "langgraph-checkpoint-sqlite>=3.0.3",
+    "nextcord>=2.6",
+    "pyyaml>=6.0.3",
+    "mcp>=1.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+    "pyright>=1.1.350",
+]
+
+[project.scripts]
+tasque = "tasque.cli.__main__:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tasque"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src"]
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "F",
+    "I",
+    "B",
+    "UP",
+    "SIM",
+    "RUF",
+]
+ignore = [
+    "E501",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]
+
+[tool.pyright]
+include = ["src/tasque"]
+pythonVersion = "3.12"
+typeCheckingMode = "strict"
+reportUnknownMemberType = false
+reportUnknownVariableType = false
+reportUnknownArgumentType = false
+reportMissingTypeStubs = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[dependency-groups]
+dev = [
+    "neo4j>=6.1.0",
+]
