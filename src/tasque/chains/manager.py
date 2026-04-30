@@ -126,11 +126,16 @@ def stop_chain(chain_id: str) -> bool:
     return True
 
 
-def render_plan_tree(chain_id: str) -> str:
+def render_plan_tree(chain_id: str, *, verbose: bool = False) -> str:
     """Return a multi-line text rendering of the chain's current plan.
 
     Used by ``tasque chain show``. Indentation reflects ``depends_on``;
-    fan-out children render under their template id.
+    fan-out children render under their template id. ``verbose=True``
+    appends each step's agent-supplied ``summary`` and, for fan-out
+    templates, a per-outcome roll-up of the children's bucket ids /
+    failure reasons — the forensic mode that makes silent fan-out
+    failures (e.g. all dispatch legs returning ``no_trades`` while the
+    user-facing chain status reads green) visible at a glance.
     """
     saver = get_chain_checkpointer()
     snapshot = saver.get_tuple(_thread_config(chain_id))
@@ -140,6 +145,9 @@ def render_plan_tree(chain_id: str) -> str:
     plan: list[PlanNode] = list(state.get("plan") or [])
     if not plan:
         return "(empty plan)"
+
+    completed: dict[str, dict[str, Any]] = dict(state.get("completed") or {})
+    failures: dict[str, str] = dict(state.get("failures") or {})
 
     parents: dict[str, list[PlanNode]] = {}
     roots: list[PlanNode] = []
@@ -157,16 +165,103 @@ def render_plan_tree(chain_id: str) -> str:
 
     lines: list[str] = []
 
+    def _summary_of(step_id: str) -> str | None:
+        cell = completed.get(step_id)
+        if not cell:
+            return None
+        text = (cell.get("summary") or "").strip()
+        if text:
+            return text
+        produces = cell.get("produces")
+        if isinstance(produces, dict):
+            inner = (produces.get("summary") or "").strip()
+            if inner:
+                return inner
+        return None
+
+    def _bucket_of_child(step_id: str) -> str | None:
+        cell = completed.get(step_id)
+        if not cell:
+            return None
+        produces = cell.get("produces") or {}
+        direct = produces.get("bucket_id")
+        if isinstance(direct, str) and direct:
+            return direct
+        nested = produces.get("bucket")
+        if isinstance(nested, dict):
+            nid = nested.get("bucket_id")
+            if isinstance(nid, str) and nid:
+                return nid
+        return None
+
+    def _fanout_rollup(template_id: str) -> list[str]:
+        """Return outcome lines for a fan-out template's children. Empty
+        list when the template has no completed children yet."""
+        kids = children_by_template.get(template_id, [])
+        if not kids:
+            return []
+        by_outcome: dict[str, list[str]] = {}
+        no_outcome: list[str] = []
+        failed: list[str] = []
+        for kid in kids:
+            kid_id = kid["id"]
+            label = _bucket_of_child(kid_id) or kid_id
+            if kid["status"] == "failed" or kid_id in failures:
+                reason = failures.get(kid_id) or kid.get("failure_reason") or "?"
+                failed.append(f"{label}: {reason}")
+                continue
+            cell = completed.get(kid_id)
+            if not cell:
+                no_outcome.append(f"{label} (status={kid['status']})")
+                continue
+            produces = cell.get("produces") or {}
+            outcome = produces.get("outcome")
+            if isinstance(outcome, str) and outcome:
+                by_outcome.setdefault(outcome, []).append(label)
+            else:
+                no_outcome.append(label)
+        out: list[str] = []
+        for outcome in sorted(by_outcome.keys()):
+            buckets = by_outcome[outcome]
+            out.append(f"{outcome} ({len(buckets)}): " + ", ".join(buckets))
+        if no_outcome:
+            out.append(f"(no outcome) ({len(no_outcome)}): " + ", ".join(no_outcome))
+        if failed:
+            out.append(f"failed ({len(failed)}):")
+            for f in failed:
+                out.append(f"  - {f}")
+        return out
+
     def _walk(node: PlanNode, depth: int) -> None:
         indent = "  " * depth
         lines.append(
             f"{indent}- {node['id']}  [{node['kind']} / {node['status']}]"
         )
+        if verbose:
+            summary = _summary_of(node["id"])
+            if summary:
+                lines.append(f"{indent}    summary: {summary}")
+            reason = failures.get(node["id"]) or node.get("failure_reason")
+            if reason:
+                lines.append(f"{indent}    failure: {reason}")
+            rollup = _fanout_rollup(node["id"])
+            if rollup:
+                lines.append(f"{indent}    fan-out outcomes:")
+                for line in rollup:
+                    lines.append(f"{indent}      - {line}")
         for child in children_by_template.get(node["id"], []):
             child_indent = "  " * (depth + 1)
             lines.append(
-                f"{child_indent}- {child['id']}  [{child['kind']} / {child['status']}]"
+                f"{child_indent}- {child['id']}  "
+                f"[{child['kind']} / {child['status']}]"
             )
+            if verbose:
+                summary = _summary_of(child["id"])
+                if summary:
+                    lines.append(f"{child_indent}    summary: {summary}")
+                reason = failures.get(child["id"]) or child.get("failure_reason")
+                if reason:
+                    lines.append(f"{child_indent}    failure: {reason}")
         for nxt in parents.get(node["id"], []):
             _walk(nxt, depth + 1)
 

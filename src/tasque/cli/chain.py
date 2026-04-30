@@ -161,13 +161,27 @@ def cmd_list(
 @chain_app.command("show")
 def cmd_show(
     chain_id: Annotated[str, typer.Argument(help="ChainRun chain_id.")],
+    verbose: Annotated[
+        bool,
+        typer.Option(
+            "--verbose",
+            "-v",
+            help=(
+                "Include per-step summaries, failure reasons, and a "
+                "fan-out outcome roll-up under each fan-out template. "
+                "Use this to forensically diagnose chain runs whose "
+                "user-facing status looks green but whose leaf workers "
+                "actually failed silently."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Render the chain's plan tree from the live checkpoint."""
     state = get_chain_state(chain_id)
     if state is None:
         typer.echo(f"no checkpoint for chain {chain_id!r}", err=True)
         raise typer.Exit(code=2)
-    typer.echo(render_plan_tree(chain_id))
+    typer.echo(render_plan_tree(chain_id, verbose=verbose))
 
 
 @chain_app.command("templates")

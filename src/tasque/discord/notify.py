@@ -97,7 +97,12 @@ def _final_step_report(state: dict[str, Any] | None) -> str:
     the overflow we post inside the thread is exactly the report whose
     truncated copy went into the embed. Falls back to the last completed
     step of any kind if all completed steps are fan-out children.
-    Returns an empty string when no completed step has produced a report.
+
+    When the chain has fan-out children, appends a per-branch outcome
+    roll-up so the thread reader sees the actual leaf results rather
+    than just the last passthrough's prose. Returns an empty string
+    when no completed step has produced a report and no rollup is
+    available.
     """
     if not state:
         return ""
@@ -107,10 +112,14 @@ def _final_step_report(state: dict[str, Any] | None) -> str:
     completed: dict[str, dict[str, Any]] = dict(completed_raw)
     non_fanout = [(k, v) for k, v in completed.items() if "[" not in k]
     items = non_fanout if non_fanout else list(completed.items())
-    if not items:
-        return ""
-    _step_id, output = items[-1]
-    return (output.get("report") or "").strip()
+    body = ""
+    if items:
+        _step_id, output = items[-1]
+        body = (output.get("report") or "").strip()
+    rollup = embeds._build_fan_out_rollup(state)
+    if rollup:
+        return (body + "\n\n" + rollup).strip() if body else rollup
+    return body
 
 
 async def _post_full_report_to_thread(

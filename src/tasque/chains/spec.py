@@ -42,12 +42,41 @@ ALLOWED_NODE_KEYS: frozenset[str] = frozenset(
         "fan_out_index",
         "fan_out_item",
         "tier",
+        "produces_schema",
     }
 )
 
 ALLOWED_SPEC_KEYS: frozenset[str] = frozenset(
     {"chain_name", "bucket", "recurrence", "plan", "planner_tier", "vars"}
 )
+
+
+class ProducesListItemsSchema(TypedDict, total=False):
+    """Per-list-item shape for ``ProducesSchema.list_items``."""
+
+    required: list[str]
+    min_count: int
+    max_count: int
+
+
+class ProducesSchema(TypedDict, total=False):
+    """Optional shape declaration for a worker step's ``produces`` dict.
+
+    Specs that omit ``produces_schema`` accept any shape (current
+    behavior). When set, ``worker.validate_produces`` runs at step-end
+    and any violation flips the step to ``failed`` with a clear reason —
+    catches passthrough aggregators that silently drop fields when the
+    LLM re-emits a list, which is the failure mode that motivated this
+    schema in the first place.
+
+    ``required`` lists top-level keys that must appear in produces.
+    ``list_items[key]`` constrains a list-valued key: every item must be
+    a dict and contain every key listed in ``required``; ``min_count`` /
+    ``max_count`` bound list length.
+    """
+
+    required: list[str]
+    list_items: dict[str, ProducesListItemsSchema]
 
 
 class PlanNode(TypedDict):
@@ -64,6 +93,10 @@ class PlanNode(TypedDict):
     API). Stored on the template; copied onto each child by
     ``_materialize_fan_out`` so the supervisor can read it during
     promotion without looking up the template separately.
+
+    ``produces_schema`` (optional) declares the shape of ``produces`` so
+    a passthrough aggregator that silently drops fields fails loudly
+    instead of corrupting downstream data. None means no enforcement.
     """
 
     id: str
@@ -80,6 +113,7 @@ class PlanNode(TypedDict):
     fan_out_index: int | None
     fan_out_item: Any
     tier: Tier | None
+    produces_schema: ProducesSchema | None
 
 
 class CompletedOutput(TypedDict):
@@ -295,6 +329,20 @@ def _validate_one_node(raw: Mapping[str, Any], *, idx: int) -> PlanNode:
             f"'depends_on': {sorted(consumes_extras)!r}"
         )
 
+    produces_schema_raw = raw.get("produces_schema")
+    produces_schema_value: ProducesSchema | None
+    if produces_schema_raw is None:
+        produces_schema_value = None
+    else:
+        if kind != "worker":
+            raise SpecError(
+                f"plan[{idx}] (id={node_id!r}) 'produces_schema' is only valid "
+                f"on worker steps"
+            )
+        produces_schema_value = _validate_produces_schema(
+            produces_schema_raw, node_id=node_id, idx=idx
+        )
+
     return PlanNode(
         id=node_id,
         kind=kind,
@@ -310,7 +358,142 @@ def _validate_one_node(raw: Mapping[str, Any], *, idx: int) -> PlanNode:
         fan_out_index=fan_out_index_raw,
         fan_out_item=raw.get("fan_out_item"),
         tier=tier_value,
+        produces_schema=produces_schema_value,
     )
+
+
+def _validate_produces_schema(
+    raw: Any, *, node_id: str, idx: int
+) -> ProducesSchema:
+    """Validate the static ``produces_schema`` declaration on a plan node."""
+    if not isinstance(raw, Mapping):
+        raise SpecError(
+            f"plan[{idx}] (id={node_id!r}) 'produces_schema' must be a mapping"
+        )
+    allowed = {"required", "list_items"}
+    extras = set(raw.keys()) - allowed
+    if extras:
+        raise SpecError(
+            f"plan[{idx}] (id={node_id!r}) 'produces_schema' has unknown keys "
+            f"{sorted(extras)!r}; allowed: {sorted(allowed)!r}"
+        )
+    out: ProducesSchema = {}
+    if "required" in raw:
+        req_raw = raw["required"]
+        if not isinstance(req_raw, list) or not all(
+            isinstance(x, str) and x for x in cast(list[Any], req_raw)
+        ):
+            raise SpecError(
+                f"plan[{idx}] (id={node_id!r}) 'produces_schema.required' "
+                f"must be a list of non-empty strings"
+            )
+        out["required"] = list(cast(list[str], req_raw))
+    if "list_items" in raw:
+        li_raw = raw["list_items"]
+        if not isinstance(li_raw, Mapping):
+            raise SpecError(
+                f"plan[{idx}] (id={node_id!r}) 'produces_schema.list_items' "
+                f"must be a mapping"
+            )
+        list_items: dict[str, ProducesListItemsSchema] = {}
+        for key, item_raw in li_raw.items():
+            if not isinstance(key, str) or not key:
+                raise SpecError(
+                    f"plan[{idx}] (id={node_id!r}) 'produces_schema.list_items' "
+                    f"has non-string key {key!r}"
+                )
+            if not isinstance(item_raw, Mapping):
+                raise SpecError(
+                    f"plan[{idx}] (id={node_id!r}) "
+                    f"'produces_schema.list_items[{key!r}]' must be a mapping"
+                )
+            allowed_item = {"required", "min_count", "max_count"}
+            extras_item = set(item_raw.keys()) - allowed_item
+            if extras_item:
+                raise SpecError(
+                    f"plan[{idx}] (id={node_id!r}) "
+                    f"'produces_schema.list_items[{key!r}]' has unknown keys "
+                    f"{sorted(extras_item)!r}; allowed: {sorted(allowed_item)!r}"
+                )
+            item_out: ProducesListItemsSchema = {}
+            if "required" in item_raw:
+                ir = item_raw["required"]
+                if not isinstance(ir, list) or not all(
+                    isinstance(x, str) and x for x in cast(list[Any], ir)
+                ):
+                    raise SpecError(
+                        f"plan[{idx}] (id={node_id!r}) "
+                        f"'produces_schema.list_items[{key!r}].required' must "
+                        f"be a list of non-empty strings"
+                    )
+                item_out["required"] = list(cast(list[str], ir))
+            for bound in ("min_count", "max_count"):
+                if bound in item_raw:
+                    val = item_raw[bound]
+                    if isinstance(val, bool) or not isinstance(val, int) or val < 0:
+                        raise SpecError(
+                            f"plan[{idx}] (id={node_id!r}) "
+                            f"'produces_schema.list_items[{key!r}].{bound}' "
+                            f"must be a non-negative integer"
+                        )
+                    item_out[bound] = val  # type: ignore[literal-required]
+            list_items[key] = item_out
+        out["list_items"] = list_items
+    return out
+
+
+def validate_produces(
+    schema: ProducesSchema | None, produces: Mapping[str, Any]
+) -> list[str]:
+    """Check that ``produces`` matches ``schema``. Returns a list of error
+    messages — empty list means it matched. ``schema=None`` always returns
+    ``[]`` (no enforcement).
+    """
+    if schema is None:
+        return []
+    errors: list[str] = []
+    required = schema.get("required") or []
+    for key in required:
+        if key not in produces:
+            errors.append(f"missing required key {key!r}")
+    list_items = schema.get("list_items") or {}
+    for key, item_schema in list_items.items():
+        value = produces.get(key)
+        if value is None:
+            # Missing-required already flagged above; if not required,
+            # silently skip the list-item check.
+            continue
+        if not isinstance(value, list):
+            errors.append(
+                f"key {key!r} must be a list, got {type(value).__name__}"
+            )
+            continue
+        items = cast(list[Any], value)
+        min_count = item_schema.get("min_count")
+        if isinstance(min_count, int) and len(items) < min_count:
+            errors.append(
+                f"key {key!r} has {len(items)} items, requires >= {min_count}"
+            )
+        max_count = item_schema.get("max_count")
+        if isinstance(max_count, int) and len(items) > max_count:
+            errors.append(
+                f"key {key!r} has {len(items)} items, requires <= {max_count}"
+            )
+        item_required = item_schema.get("required") or []
+        if not item_required:
+            continue
+        for i, item in enumerate(items):
+            if not isinstance(item, Mapping):
+                errors.append(
+                    f"key {key!r}[{i}] must be a mapping, got {type(item).__name__}"
+                )
+                continue
+            missing = [k for k in item_required if k not in item]
+            if missing:
+                errors.append(
+                    f"key {key!r}[{i}] missing keys {missing!r}"
+                )
+    return errors
 
 
 def _check_dag(plan: list[PlanNode]) -> None:
@@ -462,8 +645,11 @@ __all__ = [
     "PlanNodeKind",
     "PlanNodeOrigin",
     "PlanNodeStatus",
+    "ProducesListItemsSchema",
+    "ProducesSchema",
     "SpecError",
     "resolve_planner_tier",
     "spec_metadata",
+    "validate_produces",
     "validate_spec",
 ]

@@ -441,6 +441,61 @@ def test_checkpoint_age_seconds_returns_seconds_when_checkpoint_exists(
     assert far_age is not None and far_age >= 3600.0
 
 
+def test_produces_schema_violation_flips_step_to_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A worker that returns the wrong shape must fail the step rather
+    than silently propagate corrupt produces. This is the failure mode
+    that motivated produces_schema: the trading-scan aggregate_scans
+    LLM dropped ``trade_list`` from each list item, the chain reported
+    ``completed``, and 7 buckets ended up in ``no_trades`` despite
+    having real trades upstream."""
+
+    def _fake(job: Any, **_: Any) -> WorkerResult:
+        # Emit a list whose items are missing a required key.
+        return WorkerResult(
+            report="ok",
+            summary="ok",
+            produces={"branches": [{"bucket": "car"}, {"bucket": "home"}]},
+            error=None,
+        )
+
+    import tasque.chains.graph.worker as worker_mod
+    monkeypatch.setattr(worker_mod, "run_worker", _fake)
+
+    spec: dict[str, Any] = {
+        "chain_name": "schema-demo",
+        "bucket": "personal",
+        "recurrence": None,
+        "planner_tier": "opus",
+        "plan": [
+            {
+                "id": "agg",
+                "kind": "worker",
+                "directive": "aggregate",
+                "tier": "haiku",
+                "produces_schema": {
+                    "required": ["branches"],
+                    "list_items": {
+                        "branches": {"required": ["bucket", "trade_list"]},
+                    },
+                },
+            },
+        ],
+    }
+    chain_id = launch_chain_run(spec)
+
+    from tasque.chains.manager import get_chain_state
+
+    state = get_chain_state(chain_id)
+    assert state is not None
+    agg = next(n for n in state["plan"] if n["id"] == "agg")
+    assert agg["status"] == "failed"
+    failure_reason = (state.get("failures") or {}).get("agg") or ""
+    assert "produces_schema" in failure_reason
+    assert "trade_list" in failure_reason
+
+
 def test_launch_vars_default_to_empty_dict(monkeypatch: pytest.MonkeyPatch) -> None:
     """If neither the spec nor the launch call supplies vars, every
     worker sees an empty dict (never None or missing)."""

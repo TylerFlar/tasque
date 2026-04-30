@@ -195,6 +195,27 @@ async def test_route_skips_trivial_acks() -> None:
 
 
 @pytest.mark.asyncio
+async def test_route_does_not_skip_short_meaningful_messages() -> None:
+    """Short instructions like "do both", "approve", "go" are NOT
+    trivial acks — they're directives. Earlier versions of the router
+    dropped any message ≤10 chars, which silently lost user intent
+    (concrete repro: a Discord conversation where the user replied
+    "Do both" to a tasque proposal and got no response)."""
+    _bucket_thread()
+    poster.set_client(_FakePoster())  # type: ignore[arg-type]
+
+    for content in ("do both", "approve", "go", "look", "fix it"):
+        result = await route_message(
+            _msg(content),
+            coach_reply=_fake_reply("got it"),
+            coach_trigger=_fake_trigger({}),
+        )
+        assert result.skipped is False, (
+            f"message {content!r} was incorrectly skipped: {result.reason}"
+        )
+
+
+@pytest.mark.asyncio
 async def test_route_skips_unknown_thread() -> None:
     poster.set_client(_FakePoster())  # type: ignore[arg-type]
     # No thread registered → channel id doesn't map to a purpose.

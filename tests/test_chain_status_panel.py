@@ -325,6 +325,58 @@ def test_terminal_embed_description_is_agent_summary() -> None:
     assert embed["description"] == "weekly digest done"
 
 
+def test_terminal_embed_falls_back_to_produces_summary() -> None:
+    """Production CompletedOutput stores summary at ``produces.summary``,
+    not at the top level. The embed must read both."""
+    from tasque.discord.embeds import build_chain_terminal_embed
+
+    state = {
+        "completed": {
+            "consolidate": {
+                "report": "...",
+                "produces": {"summary": "weekly digest done"},
+            },
+        },
+    }
+    embed = build_chain_terminal_embed(_make_term_chain_run(), state, "completed")
+    assert "weekly digest done" in (embed.get("description") or "")
+
+
+def test_terminal_embed_appends_fan_out_rollup() -> None:
+    """Fan-out chains get a per-branch outcome rollup in the description.
+    Without this, the user-facing embed shows the last passthrough's
+    summary and silently hides leaf failures (the trading-scan bug:
+    8 dispatch legs all returning ``no_trades`` while the embed reads
+    green)."""
+    from tasque.discord.embeds import build_chain_terminal_embed
+
+    state = {
+        "completed": {
+            "scan": {"report": "...", "produces": {"summary": "8 ready"}},
+            "scan[0]": {
+                "report": "...",
+                "produces": {"bucket_id": "car", "outcome": "scanned"},
+            },
+            "scan[1]": {
+                "report": "...",
+                "produces": {"bucket_id": "home", "outcome": "no_trades"},
+            },
+            "scan[2]": {
+                "report": "...",
+                "produces": {"bucket_id": "wants", "outcome": "scanned"},
+            },
+        },
+    }
+    embed = build_chain_terminal_embed(_make_term_chain_run(), state, "completed")
+    desc = embed.get("description") or ""
+    # Header references the parent template id and total branch count.
+    assert "scan" in desc
+    assert "3 branches" in desc
+    # Each outcome bucket list is present.
+    assert "scanned (2): car, wants" in desc
+    assert "no_trades (1): home" in desc
+
+
 def test_embed_summary_line_reflects_step_progress() -> None:
     state = {
         "plan": [

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from tasque.chains.spec import SpecError, validate_spec
+from tasque.chains.spec import SpecError, validate_produces, validate_spec
 
 
 def _base_spec(**overrides: object) -> dict[str, object]:
@@ -332,3 +332,155 @@ def test_approval_step_without_tier_accepted() -> None:
     plan = validate_spec(spec)
     assert plan[1]["kind"] == "approval"
     assert plan[1]["tier"] is None
+
+
+# --------------------------------------------------------- produces_schema
+
+def test_produces_schema_defaults_to_none() -> None:
+    spec = _base_spec()
+    plan = validate_spec(spec)
+    assert plan[0]["produces_schema"] is None
+
+
+def test_produces_schema_required_keys_parsed() -> None:
+    spec = _base_spec(plan=[
+        {
+            "id": "a",
+            "kind": "worker",
+            "directive": "x",
+            "tier": "haiku",
+            "produces_schema": {"required": ["foo", "bar"]},
+        },
+    ])
+    plan = validate_spec(spec)
+    schema = plan[0]["produces_schema"]
+    assert schema is not None
+    assert schema.get("required") == ["foo", "bar"]
+
+
+def test_produces_schema_list_items_parsed() -> None:
+    spec = _base_spec(plan=[
+        {
+            "id": "a",
+            "kind": "worker",
+            "directive": "x",
+            "tier": "haiku",
+            "produces_schema": {
+                "required": ["branches"],
+                "list_items": {
+                    "branches": {
+                        "required": ["bucket", "outcome"],
+                        "min_count": 1,
+                    },
+                },
+            },
+        },
+    ])
+    plan = validate_spec(spec)
+    schema = plan[0]["produces_schema"]
+    assert schema is not None
+    list_items = schema.get("list_items") or {}
+    assert "branches" in list_items
+    assert list_items["branches"].get("required") == ["bucket", "outcome"]
+    assert list_items["branches"].get("min_count") == 1
+
+
+def test_produces_schema_unknown_top_level_key_rejected() -> None:
+    spec = _base_spec(plan=[
+        {
+            "id": "a",
+            "kind": "worker",
+            "directive": "x",
+            "tier": "haiku",
+            "produces_schema": {"properties": {"foo": "str"}},
+        },
+    ])
+    with pytest.raises(SpecError, match="produces_schema"):
+        validate_spec(spec)
+
+
+def test_produces_schema_on_approval_step_rejected() -> None:
+    spec = _base_spec(plan=[
+        {"id": "a", "kind": "worker", "directive": "x", "tier": "haiku"},
+        {
+            "id": "b",
+            "kind": "approval",
+            "directive": "approve",
+            "depends_on": ["a"],
+            "consumes": ["a"],
+            "produces_schema": {"required": ["foo"]},
+        },
+    ])
+    with pytest.raises(SpecError, match="produces_schema"):
+        validate_spec(spec)
+
+
+def test_validate_produces_no_schema_passes_anything() -> None:
+    assert validate_produces(None, {"foo": 1, "bar": []}) == []
+    assert validate_produces(None, {}) == []
+
+
+def test_validate_produces_required_keys_missing_flagged() -> None:
+    schema = {"required": ["foo", "bar"]}
+    errs = validate_produces(schema, {"foo": 1})
+    assert any("'bar'" in e for e in errs)
+
+
+def test_validate_produces_list_item_missing_keys_flagged() -> None:
+    """The aggregate_scans bug: passthrough aggregator drops keys from
+    list items. The schema's list_items.required must catch it."""
+    schema = {
+        "required": ["branches"],
+        "list_items": {
+            "branches": {"required": ["bucket", "trade_list"]},
+        },
+    }
+    produces = {
+        "branches": [
+            {"bucket": "car", "outcome": "scanned"},  # missing trade_list
+            {"bucket": "home", "trade_list": []},     # OK
+        ],
+    }
+    errs = validate_produces(schema, produces)
+    assert any("trade_list" in e and "[0]" in e for e in errs)
+    # Item 1 has both required keys, no error for it.
+    assert not any("[1]" in e for e in errs)
+
+
+def test_validate_produces_list_item_not_dict_flagged() -> None:
+    schema = {
+        "required": ["branches"],
+        "list_items": {"branches": {"required": ["bucket"]}},
+    }
+    errs = validate_produces(schema, {"branches": ["just-a-string"]})
+    assert any("must be a mapping" in e for e in errs)
+
+
+def test_validate_produces_list_count_bounds() -> None:
+    schema = {
+        "list_items": {
+            "branches": {"min_count": 2, "max_count": 3},
+        },
+    }
+    assert validate_produces(schema, {"branches": [{}, {}]}) == []
+    errs_under = validate_produces(schema, {"branches": [{}]})
+    assert any("requires >= 2" in e for e in errs_under)
+    errs_over = validate_produces(schema, {"branches": [{}, {}, {}, {}]})
+    assert any("requires <= 3" in e for e in errs_over)
+
+
+def test_validate_produces_clean_pass_returns_empty() -> None:
+    schema = {
+        "required": ["branches", "summary"],
+        "list_items": {
+            "branches": {"required": ["bucket", "outcome"]},
+        },
+    }
+    produces = {
+        "summary": "ok",
+        "branches": [
+            {"bucket": "a", "outcome": "scanned"},
+            {"bucket": "b", "outcome": "scanned"},
+        ],
+    }
+    assert validate_produces(schema, produces) == []

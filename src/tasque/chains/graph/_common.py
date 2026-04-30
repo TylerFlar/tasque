@@ -17,6 +17,7 @@ from tasque.chains.spec import (
     CompletedOutput,
     HistoryEntry,
     PlanNode,
+    ProducesSchema,
 )
 
 
@@ -167,6 +168,7 @@ class _WorkerInput(TypedDict):
     on_failure: str
     tier: str
     vars: dict[str, Any]
+    produces_schema: ProducesSchema | None
 
 
 class _ApprovalInput(TypedDict):

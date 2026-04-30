@@ -44,7 +44,6 @@ from tasque.reply.strategist import run_strategist_reply
 log = structlog.get_logger(__name__)
 
 TRIVIAL_ACK_RE = re.compile(r"^(ok|thx|yes|no|sure)\.?$", re.IGNORECASE)
-TRIVIAL_ACK_LIMIT = 10
 
 
 @runtime_checkable
@@ -90,10 +89,14 @@ class RouteResult:
 
 
 def _is_trivial(content: str) -> bool:
+    """A trivial-ack reply ("ok", "thx", "yes", …) doesn't deserve a
+    full agent invocation. Limited to the explicit regex list — earlier
+    versions also dropped any message ≤10 chars, but that ate real
+    short-but-meaningful instructions ("do both", "approve", "go", "look")
+    and silently lost user intent. Trust the explicit list; let
+    everything else through to the agent."""
     stripped = content.strip()
     if not stripped:
-        return True
-    if len(stripped) <= TRIVIAL_ACK_LIMIT:
         return True
     return bool(TRIVIAL_ACK_RE.match(stripped))
 

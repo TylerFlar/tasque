@@ -187,6 +187,101 @@ def _pick_final_completed_step(
     return items[-1]
 
 
+def _fan_out_children(
+    completed: dict[str, dict[str, Any]], template_id: str
+) -> list[tuple[int, dict[str, Any]]]:
+    """Return ``[(index, completed_cell), …]`` for fan-out children of
+    ``template_id``, in numeric index order."""
+    prefix = f"{template_id}["
+    out: list[tuple[int, dict[str, Any]]] = []
+    for k, v in completed.items():
+        if not k.startswith(prefix) or not k.endswith("]"):
+            continue
+        try:
+            idx = int(k[len(prefix):-1])
+        except ValueError:
+            continue
+        out.append((idx, v))
+    out.sort(key=lambda t: t[0])
+    return out
+
+
+def _bucket_id_of_branch(produces: dict[str, Any]) -> str | None:
+    """Pull a bucket identifier out of a fan-out branch's produces dict.
+
+    Trading chain branches put it under ``bucket_id`` directly, or
+    nested under ``bucket.bucket_id`` (when the upstream forwarded the
+    full bucket dict). Returns the first non-empty match.
+    """
+    direct = produces.get("bucket_id")
+    if isinstance(direct, str) and direct:
+        return direct
+    nested = produces.get("bucket")
+    if isinstance(nested, dict):
+        nid = nested.get("bucket_id")
+        if isinstance(nid, str) and nid:
+            return nid
+    return None
+
+
+def _build_fan_out_rollup(state: dict[str, Any] | None) -> str | None:
+    """Summarize the latest top-level step with fan-out children.
+
+    Returns a short multi-line string (outcome → bucket list) when a
+    fan-out chain finished, otherwise None. Used by the chain terminal
+    embed so a chain like trading-scan whose last top-level step is a
+    passthrough doesn't post a vacuous "8 branches ready" line — the
+    user sees what the dispatch legs actually decided.
+    """
+    if not state:
+        return None
+    completed_raw = state.get("completed") or {}
+    if not completed_raw:
+        return None
+    completed: dict[str, dict[str, Any]] = dict(completed_raw)
+    top_level_ids = [k for k in completed if "[" not in k]
+    # Walk in reverse — the last top-level step that *has* children is
+    # the one whose outcomes the user cares about.
+    target_id: str | None = None
+    children: list[tuple[int, dict[str, Any]]] = []
+    for tid in reversed(top_level_ids):
+        kids = _fan_out_children(completed, tid)
+        if kids:
+            target_id = tid
+            children = kids
+            break
+    if target_id is None or not children:
+        return None
+
+    by_outcome: dict[str, list[str]] = {}
+    failures: dict[str, str] = dict(state.get("failures") or {})
+    failed_ids: list[str] = [
+        k for k in failures if k.startswith(f"{target_id}[")
+    ]
+    no_outcome: list[str] = []
+    for idx, cell in children:
+        produces = cell.get("produces") or {}
+        outcome = produces.get("outcome")
+        bucket = _bucket_id_of_branch(produces) or f"#{idx}"
+        if not isinstance(outcome, str) or not outcome:
+            no_outcome.append(bucket)
+            continue
+        by_outcome.setdefault(outcome, []).append(bucket)
+
+    n_total = len(children) + len(failed_ids)
+    parts: list[str] = [f"**{target_id}** — {n_total} branches"]
+    for outcome in sorted(by_outcome.keys()):
+        bucket_list = ", ".join(by_outcome[outcome])
+        parts.append(f"• {outcome} ({len(by_outcome[outcome])}): {bucket_list}")
+    if no_outcome:
+        parts.append(
+            f"• (no outcome) ({len(no_outcome)}): " + ", ".join(no_outcome)
+        )
+    if failed_ids:
+        parts.append(f"• failed ({len(failed_ids)}): " + ", ".join(failed_ids))
+    return "\n".join(parts)
+
+
 def build_chain_terminal_embed(
     chain_run: ChainRun,
     state: dict[str, Any] | None,
@@ -229,12 +324,31 @@ def build_chain_terminal_embed(
     if final is not None:
         _step_id, output = final
         # The agent emits a short summary alongside the long report; the
-        # summary is what belongs in the description. Older WorkerResults
-        # that didn't carry a summary fall through with empty description
-        # and the user reads the thread.
-        summary_text = (output.get("summary") or "").strip()
-        if summary_text:
-            description = _truncate(summary_text, EMBED_DESC_LIMIT)
+        # summary is what belongs in the description. Production
+        # CompletedOutput stores it at ``produces.summary``; older test
+        # fixtures place it at the top level — accept either.
+        summary_raw = output.get("summary")
+        if not isinstance(summary_raw, str) or not summary_raw.strip():
+            inner_produces = output.get("produces")
+            if isinstance(inner_produces, dict):
+                summary_raw = inner_produces.get("summary")
+        if isinstance(summary_raw, str) and summary_raw.strip():
+            description = _truncate(summary_raw.strip(), EMBED_DESC_LIMIT)
+
+    # If the chain has fan-out children, append a per-branch outcome
+    # roll-up. The agent's summary is whatever the last top-level step
+    # wrote (often a passthrough aggregator's "n branches ready" line)
+    # and tells the user nothing about the actual fan-out outcomes —
+    # the rollup makes silent failures (e.g. 8/8 dispatch legs returning
+    # ``no_trades`` when prior steps had real trades) immediately
+    # visible.
+    rollup = _build_fan_out_rollup(state)
+    if rollup:
+        if description:
+            description = description + "\n\n" + rollup
+        else:
+            description = rollup
+        description = _truncate(description, EMBED_DESC_LIMIT)
 
     embed: dict[str, Any] = {
         "title": _truncate(title, EMBED_TITLE_LIMIT),

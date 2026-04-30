@@ -128,6 +128,159 @@ def test_supervisor_materializes_fan_out_with_good_list() -> None:
     assert template["status"] == "completed"
 
 
+def test_supervisor_chained_fan_out_synthesizes_items_from_upstream_template() -> None:
+    """``fan_out_on`` may name an upstream fan-out template directly. The
+    items are the upstream children's ``produces`` dicts in fan-out-index
+    order, with no LLM passthrough aggregator in the middle. This is the
+    structural fix for the trading-scan failure where an LLM aggregator
+    hallucinated branch contents while the schema check passed (key
+    shape was valid; values were fabricated)."""
+    plan = [
+        _node(id="scan", status="completed", fan_out_on="buckets"),
+        # scan has two materialized children with real produces.
+        _node(
+            id="scan[0]",
+            depends_on=["scan"],
+            consumes=["scan"],
+            status="completed",
+            fan_out_index=0,
+        ),
+        _node(
+            id="scan[1]",
+            depends_on=["scan"],
+            consumes=["scan"],
+            status="completed",
+            fan_out_index=1,
+        ),
+        # news_veto fans out over scan's children directly.
+        _node(
+            id="news_veto",
+            depends_on=["scan"],
+            consumes=["scan"],
+            fan_out_on="scan",
+        ),
+    ]
+    completed = {
+        "scan[0]": {
+            "report": "ok",
+            "produces": {"bucket_id": "car", "trade_list": [1, 2, 3]},
+        },
+        "scan[1]": {
+            "report": "ok",
+            "produces": {"bucket_id": "home", "trade_list": []},
+        },
+    }
+    update = supervisor({"plan": plan, "completed": completed, "failures": {}})
+    new_plan = update["plan"]
+    ids = sorted(n["id"] for n in new_plan)
+    assert "news_veto[0]" in ids
+    assert "news_veto[1]" in ids
+    nv0 = next(n for n in new_plan if n["id"] == "news_veto[0]")
+    nv1 = next(n for n in new_plan if n["id"] == "news_veto[1]")
+    # The fan_out_item is the upstream child's produces dict, byte-for-byte.
+    assert nv0["fan_out_item"] == {"bucket_id": "car", "trade_list": [1, 2, 3]}
+    assert nv1["fan_out_item"] == {"bucket_id": "home", "trade_list": []}
+    template = next(n for n in new_plan if n["id"] == "news_veto")
+    assert template["status"] == "completed"
+
+
+def test_supervisor_chained_fan_out_single_pass_race() -> None:
+    """When two fan-out templates chain (``scan`` → ``news_veto`` where
+    news_veto.fan_out_on='scan'), the supervisor must NOT materialize
+    both in a single pass. Otherwise the news_veto deps check fires
+    before scan's children are added to plan, sees zero children, and
+    materializes news_veto with zero items via the chained-fan-out
+    path. The chain then "completes" with no work done.
+
+    The fix: plan is extended in-place during the materialization loop
+    so the second template sees scan's pending children and correctly
+    defers to a later supervisor pass.
+
+    This is the regression for the trading-scan run that completed at
+    20:11 UTC on 2026-04-30 with scan[0..7] running but news_veto and
+    dispatch templates marked completed with zero children — the chain
+    silently skipped the entire trading dispatch phase."""
+    # enumerate_buckets has just completed; scan template is pending
+    # with deps satisfied. news_veto and dispatch templates also exist
+    # in plan. completed dict contains enumerate_buckets only.
+    plan = [
+        _node(id="enumerate_buckets", status="completed"),
+        _node(
+            id="scan",
+            depends_on=["enumerate_buckets"],
+            consumes=["enumerate_buckets"],
+            fan_out_on="buckets",
+        ),
+        _node(
+            id="news_veto",
+            depends_on=["scan"],
+            consumes=["scan"],
+            fan_out_on="scan",
+        ),
+        _node(
+            id="dispatch",
+            depends_on=["news_veto"],
+            consumes=["news_veto"],
+            fan_out_on="news_veto",
+        ),
+    ]
+    completed = {
+        "enumerate_buckets": {
+            "report": "ok",
+            "produces": {"buckets": [{"bucket_id": "car"}, {"bucket_id": "home"}]},
+        },
+    }
+    update = supervisor({"plan": plan, "completed": completed, "failures": {}})
+    new_plan = update["plan"]
+
+    # scan must have materialized 2 children.
+    scan_children = [n for n in new_plan if n["id"].startswith("scan[")]
+    assert len(scan_children) == 2, (
+        f"expected scan to materialize 2 children, got {len(scan_children)}"
+    )
+
+    # news_veto must NOT have materialized in this same pass — its
+    # deps include scan's just-added pending children.
+    nv = next(n for n in new_plan if n["id"] == "news_veto")
+    assert nv["status"] == "pending", (
+        f"news_veto must defer materialization until scan's children "
+        f"complete; got status={nv['status']}"
+    )
+    nv_children = [n for n in new_plan if n["id"].startswith("news_veto[")]
+    assert nv_children == [], (
+        f"news_veto must NOT have any children yet; got {len(nv_children)}"
+    )
+
+    dispatch = next(n for n in new_plan if n["id"] == "dispatch")
+    assert dispatch["status"] == "pending"
+
+
+def test_supervisor_chained_fan_out_requires_consumes() -> None:
+    """If you fan out over an upstream fan-out template you must also
+    consume it — the worker needs the items as ``consumes_payload``."""
+    plan = [
+        _node(id="scan", status="completed", fan_out_on="buckets"),
+        _node(
+            id="scan[0]",
+            depends_on=["scan"],
+            consumes=["scan"],
+            status="completed",
+            fan_out_index=0,
+        ),
+        _node(
+            id="news_veto",
+            depends_on=["scan"],
+            consumes=[],  # <-- missing 'scan'
+            fan_out_on="scan",
+        ),
+    ]
+    completed = {"scan[0]": {"report": "ok", "produces": {}}}
+    update = supervisor({"plan": plan, "completed": completed, "failures": {}})
+    template = next(n for n in update["plan"] if n["id"] == "news_veto")
+    assert template["status"] == "failed"
+    assert "consumes" in (template.get("failure_reason") or "")
+
+
 def test_supervisor_completes_template_on_empty_fan_out_list() -> None:
     """An empty list from upstream is a legitimate "nothing to do"
     outcome — the template completes with zero children rather than

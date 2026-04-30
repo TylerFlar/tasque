@@ -127,12 +127,54 @@ def _materialize_fan_out(
     Children inherit the template's ``directive``, ``consumes``, and
     ``on_failure``. Their ``id`` is ``template[i]``; ``fan_out_on`` is
     cleared to prevent recursive fan-out.
+
+    Two resolution paths for the items list:
+
+    1. **Upstream is itself a fan-out template** — when ``fan_out_on``
+       names a dep id whose plan node is also a fan-out template, the
+       items are the children's ``produces`` dicts in fan-out-index
+       order. This is the chained-fan-out path (e.g. ``scan`` fans out
+       per bucket → ``news_veto`` fans out per ``scan`` branch). It
+       eliminates the need for an LLM passthrough aggregator step —
+       the LLM-as-data-pipe pattern was load-bearingly fragile (the
+       2026-04-30 trading-scan run had ``aggregate_news_veto`` (haiku)
+       hallucinate every branch's ``bucket`` and ``trade_list`` while
+       still producing a schema-valid shape, sending fabricated trades
+       to dispatch).
+
+    2. **Upstream produces has the key as a list** — the original
+       behavior: any dep whose ``produces[fan_key]`` is a list serves
+       as the source. Used when the items are computed inside a
+       worker's directive (e.g. ``enumerate_buckets`` produces a
+       ``buckets`` list that ``scan`` fans out over).
     """
     fan_key = template["fan_out_on"]
     assert fan_key is not None  # caller checks
+
+    # Path 1: chained fan-out — upstream dep id matches and is a
+    # fan-out template itself. Items are the synthesized child
+    # produces list, in deterministic fan-out-index order.
+    if fan_key in template["depends_on"]:
+        fan_template = _node_by_id(plan, fan_key)
+        if fan_template is not None and fan_template.get("fan_out_on") is not None:
+            if fan_key not in template["consumes"]:
+                return [], (
+                    f"fan_out_on={fan_key!r} resolves to fan-out template "
+                    f"{fan_key!r} but it's not in 'consumes'; add it"
+                )
+            children_of_fan = sorted(
+                _children_of(plan, fan_key),
+                key=lambda n: n.get("fan_out_index") or 0,
+            )
+            items: list[Any] = [
+                completed.get(c["id"], {}).get("produces", {})
+                for c in children_of_fan
+            ]
+            return _build_fan_out_children(template, items), None
+
+    # Path 2: legacy — find fan_key inside an upstream's produces dict.
     upstream_id: str | None = None
     for dep in template["depends_on"]:
-        # Heuristic: pick the first upstream dep that has the key.
         cell = completed.get(dep)
         if cell is not None and fan_key in cell.get("produces", {}):
             upstream_id = dep
@@ -141,6 +183,7 @@ def _materialize_fan_out(
     if upstream_id is None:
         return [], (
             f"fan_out_on={fan_key!r} not found in any upstream produces "
+            f"and no dep matches a fan-out template "
             f"(consumes={template['consumes']!r})"
         )
     if upstream_id not in template["consumes"]:
@@ -161,7 +204,15 @@ def _materialize_fan_out(
     # research today). Mark the template completed with zero children;
     # downstream steps that consume this template see ``[]`` and can
     # short-circuit. Failing here would halt the chain over a no-op.
+    return _build_fan_out_children(template, items), None
 
+
+def _build_fan_out_children(
+    template: PlanNode, items: list[Any]
+) -> list[PlanNode]:
+    """Construct one child plan node per item. Pulled out of
+    ``_materialize_fan_out`` so both resolution paths share the
+    same shape."""
     children: list[PlanNode] = []
     for i, item in enumerate(items):
         child: PlanNode = {
@@ -184,9 +235,10 @@ def _materialize_fan_out(
             # Children inherit the template's tier — every fan-out
             # branch runs at the same model size as its parent.
             "tier": template.get("tier"),
+            "produces_schema": template.get("produces_schema"),
         }
         children.append(child)
-    return children, None
+    return children
 
 
 # ----------------------------------------------------------------- supervisor
@@ -230,7 +282,19 @@ def supervisor(state: ChainStateSchema) -> dict[str, Any]:
                 })
 
     # 2. Materialize fan-outs (pending workers with fan_out_on, deps OK).
-    new_children: list[PlanNode] = []
+    #
+    # Plan extension is in-place during the loop so subsequent templates
+    # see freshly-materialized children. This matters for chained
+    # fan-outs (``scan`` → ``news_veto`` → ``dispatch``, where each step
+    # has ``fan_out_on`` pointing at the previous fan-out template):
+    # without in-place extension, all three templates' dep checks fire
+    # against the original snapshot, scan's children aren't visible yet,
+    # and ``_all_dep_ids_satisfied`` for news_veto trivially returns
+    # True (zero unfinished children, because zero children at all).
+    # news_veto then materializes with zero items via the chained path,
+    # and dispatch follows. The chain "completes" with no work done.
+    # Adding children to plan immediately means subsequent templates see
+    # them as pending and correctly defer to a later supervisor pass.
     for n in list(plan):
         if (
             n["status"] != "pending"
@@ -267,8 +331,7 @@ def supervisor(state: ChainStateSchema) -> dict[str, Any]:
                 "fan_out_count": len(children),
             },
         })
-        new_children.extend(children)
-    plan.extend(new_children)
+        plan.extend(children)
 
     # 3. Promote pending → running for steps whose deps are satisfied.
     # Track running siblings per fan-out template so we can enforce
@@ -362,6 +425,7 @@ def _build_send_for_step(
         "on_failure": step["on_failure"],
         "tier": tier,
         "vars": chain_vars,
+        "produces_schema": step.get("produces_schema"),
     }
     return Send(WORKER_NODE, worker_input)
 

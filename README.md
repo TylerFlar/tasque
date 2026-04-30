@@ -399,11 +399,17 @@ uv run tasque chain queue path/to/spec.json           # ad-hoc one-shot
 uv run tasque chain templates --enabled-only
 uv run tasque chain list --status running
 uv run tasque chain show <chain-id>                   # render plan tree
+uv run tasque chain show <chain-id> --verbose         # +per-step summaries, fan-out outcome roll-up
 uv run tasque chain pause  <chain-id>
 uv run tasque chain resume <chain-id>
 uv run tasque chain stop   <chain-id>
 uv run tasque chain delete <template-name>
 ```
+
+`chain show --verbose` is the forensic mode: under each fan-out template
+it lists how many children landed in each `produces.outcome` value with
+the bucket ids that landed there. Useful for diagnosing chain runs that
+report `completed` overall but had leaf workers fail or no-op silently.
 
 Mirror columns on `ChainTemplate` (`recurrence`, `bucket`) must match the
 values inside `plan_json`. Every write goes through `validate_spec`,
@@ -415,6 +421,60 @@ the template node — useful when the children contend on a shared
 resource (single browser profile, rate-limited API). The supervisor
 defers promotion of pending siblings until the count drops below the
 cap.
+
+### Chained fan-out
+
+A worker step's `fan_out_on` may name an upstream fan-out template
+directly. The items list is then synthesized from that template's
+children's `produces` dicts, in fan-out-index order — no LLM
+passthrough aggregator needed in between:
+
+```yaml
+- id: scan
+  fan_out_on: buckets        # fans out per enumerate_buckets.produces.buckets
+
+- id: news_veto
+  depends_on: [scan]
+  consumes: [scan]
+  fan_out_on: scan           # fans out per scan child's produces
+
+- id: dispatch
+  depends_on: [news_veto]
+  consumes: [news_veto]
+  fan_out_on: news_veto      # fans out per news_veto child's produces
+```
+
+The legacy form (`fan_out_on` naming a list-valued key inside an upstream
+worker's `produces`) still works — that's how a fan-out is seeded from a
+single non-fan-out worker's output (e.g. `enumerate_buckets` produces a
+`buckets` list).
+
+### Schema-enforced `produces`
+
+Optional `produces_schema` on a worker plan node declares the shape the
+step's `produces` dict must satisfy. The chain engine validates against
+it after `submit_worker_result` and flips the step to `failed` on
+mismatch:
+
+```yaml
+- id: scan
+  produces_schema:
+    required: [bucket, trade_list, outcome, summary]
+
+- id: agg
+  produces_schema:
+    required: [branches]
+    list_items:
+      branches:
+        required: [bucket, outcome]
+        min_count: 1
+```
+
+Catches the common "LLM forgot to include a key" failure mode at the
+emitting step instead of letting corrupt produces propagate downstream.
+Note: the schema verifies key presence and (for list items) per-item
+key presence, not value semantics — passthrough aggregators that need
+byte-for-byte fidelity should use chained fan-out instead.
 
 ## Discord
 
