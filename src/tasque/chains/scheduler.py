@@ -515,7 +515,7 @@ def _checkpoint_age_seconds(chain_id: str, *, now: datetime | None = None) -> fl
     if snap is None:
         return None
     raw_ts = snap.checkpoint.get("ts")
-    if not isinstance(raw_ts, str) or not raw_ts:
+    if not raw_ts:
         return None
     try:
         ts = datetime.fromisoformat(raw_ts)

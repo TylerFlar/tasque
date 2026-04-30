@@ -31,7 +31,6 @@ from langgraph.graph import END, START, StateGraph
 from tasque.agents import result_inbox
 from tasque.llm.factory import (
     ALL_TIERS,
-    Tier,
     get_chat_model_for_tier,
 )
 from tasque.memory.entities import Note, QueuedJob
@@ -241,7 +240,7 @@ def _call_llm(state: WorkerState) -> dict[str, Any]:
                     ),
                 )
             }
-        llm = get_chat_model_for_tier(cast(Tier, tier))
+        llm = get_chat_model_for_tier(tier)
     messages = state.get("messages") or []
     try:
         response = llm.invoke(messages)

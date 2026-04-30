@@ -9,9 +9,10 @@ asking the bot to publish a Discord message on the coach's behalf.
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import pytest
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from pydantic import ValidationError
 
 from tasque.agents import result_inbox

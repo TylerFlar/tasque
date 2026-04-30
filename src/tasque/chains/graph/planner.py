@@ -31,7 +31,7 @@ from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from tasque.agents import result_inbox
 from tasque.chains.graph._common import ChainStateSchema, _now_iso
 from tasque.chains.spec import HistoryEntry, PlanNode, validate_spec
-from tasque.llm.factory import ALL_TIERS, Tier, get_chat_model_for_tier
+from tasque.llm.factory import ALL_TIERS, get_chat_model_for_tier
 
 PLANNER_SYSTEM_PROMPT = """\
 You are the tasque chain planner. A chain step has failed (or otherwise
@@ -193,7 +193,7 @@ def planner(state: ChainStateSchema) -> dict[str, Any]:
     failures: dict[str, str] = state.get("failures") or {}
     llm = cast(BaseChatModel | None, cast(dict[str, Any], state).get("llm"))
     if llm is None:
-        planner_tier = cast(str | None, state.get("planner_tier"))
+        planner_tier = state.get("planner_tier")
         if not planner_tier or planner_tier not in ALL_TIERS:
             err_history: list[HistoryEntry] = [{
                 "timestamp": _now_iso(),
@@ -207,7 +207,7 @@ def planner(state: ChainStateSchema) -> dict[str, Any]:
                 },
             }]
             return {"replan": False, "history": err_history}
-        llm = get_chat_model_for_tier(cast(Tier, planner_tier))
+        llm = get_chat_model_for_tier(planner_tier)
 
     token = result_inbox.mint_token()
     user = (

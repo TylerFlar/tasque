@@ -795,6 +795,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": {"message": str(exc)}})
             return
         seconds_raw = body.get("seconds")
+        if seconds_raw is None:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": {"message": "seconds must be a positive number"}},
+            )
+            return
         try:
             seconds = float(seconds_raw)
         except (TypeError, ValueError):

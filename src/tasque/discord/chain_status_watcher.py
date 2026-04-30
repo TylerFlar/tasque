@@ -21,7 +21,7 @@ import asyncio
 import json
 import os
 import time
-from typing import Any
+from typing import Any, cast
 
 import structlog
 from sqlalchemy import select
@@ -34,6 +34,7 @@ from tasque.discord.chain_status_panel import (
     build_chain_status_snapshot,
     is_terminal_run,
 )
+from tasque.discord.notify import ChainEventKind
 from tasque.memory.db import get_session
 from tasque.memory.entities import ChainRun, utc_now_iso
 
@@ -341,9 +342,14 @@ async def _tick(
                 chain_run.chain_id not in notified_terminal
                 and chain_run.terminal_notified_at is None
             ):
+                # is_terminal_run() narrowed run_status to one of
+                # "completed" / "failed" / "stopped" — all members of
+                # ChainEventKind. Pyright can't see that across the
+                # bool-returning helper, so re-assert the type.
+                terminal_kind = cast(ChainEventKind, snapshot["run_status"])
                 try:
                     await notify.notify_chain_terminal(
-                        chain_run, state, snapshot["run_status"],
+                        chain_run, state, terminal_kind,
                     )
                     log.info(
                         "discord.chain_status.terminal_notified",

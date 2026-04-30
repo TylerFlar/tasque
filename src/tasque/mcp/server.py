@@ -65,6 +65,8 @@ from tasque.chains.scheduler import launch_chain_run
 from tasque.chains.spec import SpecError, validate_spec
 from tasque.jobs.cron import next_fire_at, to_iso, validate_cron
 from tasque.llm.factory import ALL_TIERS
+from tasque.mcp.condense import maybe_condense
+from tasque.mcp.tool_triggers import dispatch_tool_event
 from tasque.memory.db import get_session
 from tasque.memory.entities import (
     Aim,
@@ -247,7 +249,17 @@ def build_server() -> FastMCP:
             + ", ".join(sorted(ALL_BUCKETS)) + "). Use the bucket your "
             "system prompt names. Mutations return {\"ok\": true, ...} on "
             "success or {\"ok\": false, \"error\": \"...\"} on "
-            "validation/runtime failure."
+            "validation/runtime failure.\n\n"
+            "Read tools (note_*, job_get/list, chain_template_*, "
+            "chain_run_get/list, signal_list, aim_get/list, "
+            "bucket_summary) take a required `intent` argument: one short "
+            "sentence describing what you want from this call (e.g. "
+            "'durable health notes mentioning sleep', 'pending jobs in "
+            "career'). When the raw result exceeds ~60KB it is condensed "
+            "by a haiku call using your intent as the filter and returned "
+            "as {\"_condensed\": true, \"_intent\": ..., \"summary\": "
+            "...}. Write a precise intent — vague intents waste the "
+            "condense pass."
         ),
     )
 
@@ -279,21 +291,30 @@ def build_server() -> FastMCP:
             meta=meta or {},
         )
         written = write_entity(n)
+        dispatch_tool_event("note_create", bucket=bucket, source=source)
         return _ok(id=written.id)
 
     @mcp.tool()
-    def note_get(note_id: str) -> str:
+    def note_get(intent: str, note_id: str) -> str:
         """Fetch one note by id (full untruncated content), or
-        {"ok": false, "error": "missing"} if no such note."""
+        {"ok": false, "error": "missing"} if no such note.
+
+        ``intent`` (required): one short sentence on why you're reading
+        this note — used to condense the result if oversize."""
         with get_session() as sess:
             row = sess.get(Note, note_id)
             if row is None:
                 return _err("missing")
             sess.expunge(row)
-        return json.dumps(_serialize_note(row))
+        return maybe_condense(
+            json.dumps(_serialize_note(row)),
+            intent=intent,
+            tool_name="note_get",
+        )
 
     @mcp.tool()
     def note_list(
+        intent: str,
         bucket: str,
         durability: str | None = None,
         include_archived: bool = False,
@@ -301,7 +322,10 @@ def build_server() -> FastMCP:
     ) -> str:
         """List notes in ``bucket`` (newest first). Optional filters:
         ``durability`` ('ephemeral' / 'durable' / 'behavioral') and
-        ``include_archived`` (default False). Returns a JSON array."""
+        ``include_archived`` (default False). Returns a JSON array.
+
+        ``intent`` (required): one short sentence on what you're looking
+        for — used to condense the result if oversize."""
         if (msg := _validate_bucket(bucket)) is not None:
             return _err(msg)
         if durability is not None and (msg := _validate_durability(durability)) is not None:
@@ -317,10 +341,15 @@ def build_server() -> FastMCP:
             stmt = stmt.order_by(Note.updated_at.desc()).limit(limit)
             rows = list(sess.execute(stmt).scalars().all())
             sess.expunge_all()
-        return json.dumps([_serialize_note(n) for n in rows])
+        return maybe_condense(
+            json.dumps([_serialize_note(n) for n in rows]),
+            intent=intent,
+            tool_name="note_list",
+        )
 
     @mcp.tool()
     def note_search(
+        intent: str,
         bucket: str,
         query: str,
         durability: str | None = None,
@@ -329,7 +358,10 @@ def build_server() -> FastMCP:
         """Substring search (case-insensitive) over note content within
         ``bucket``. Returns up to ``limit`` matches newest-first; each
         note's content is truncated to ~400 chars in the result — call
-        ``note_get`` for full content."""
+        ``note_get`` for full content.
+
+        ``intent`` (required): one short sentence on what you're looking
+        for — used to condense the result if oversize."""
         if (msg := _validate_bucket(bucket)) is not None:
             return _err(msg)
         if durability is not None and (msg := _validate_durability(durability)) is not None:
@@ -350,16 +382,24 @@ def build_server() -> FastMCP:
             stmt = stmt.order_by(Note.updated_at.desc()).limit(limit)
             rows = list(sess.execute(stmt).scalars().all())
             sess.expunge_all()
-        return json.dumps([_serialize_note(n, truncate=400) for n in rows])
+        return maybe_condense(
+            json.dumps([_serialize_note(n, truncate=400) for n in rows]),
+            intent=intent,
+            tool_name="note_search",
+        )
 
     @mcp.tool()
     def note_search_any(
+        intent: str,
         bucket: str,
         keywords: list[str],
         durability: str | None = None,
         limit: int = 10,
     ) -> str:
-        """Like ``note_search`` but matches any keyword (OR-style)."""
+        """Like ``note_search`` but matches any keyword (OR-style).
+
+        ``intent`` (required): one short sentence on what you're looking
+        for — used to condense the result if oversize."""
         if (msg := _validate_bucket(bucket)) is not None:
             return _err(msg)
         if durability is not None and (msg := _validate_durability(durability)) is not None:
@@ -381,10 +421,15 @@ def build_server() -> FastMCP:
             stmt = stmt.order_by(Note.updated_at.desc()).limit(limit)
             rows = list(sess.execute(stmt).scalars().all())
             sess.expunge_all()
-        return json.dumps([_serialize_note(n, truncate=400) for n in rows])
+        return maybe_condense(
+            json.dumps([_serialize_note(n, truncate=400) for n in rows]),
+            intent=intent,
+            tool_name="note_search_any",
+        )
 
     @mcp.tool()
     def note_search_fts(
+        intent: str,
         bucket: str,
         query: str,
         durability: str | None = None,
@@ -395,7 +440,10 @@ def build_server() -> FastMCP:
         relevance-ordered results. Query syntax: bare words AND, ``OR``
         for alternatives, ``"phrase"`` exact, ``-word`` exclude,
         ``NEAR(x y, 5)`` proximity. Returns the literal string
-        ``"fts5_unavailable"`` if the host SQLite lacks FTS5."""
+        ``"fts5_unavailable"`` if the host SQLite lacks FTS5.
+
+        ``intent`` (required): one short sentence on what you're looking
+        for — used to condense the result if oversize."""
         if (msg := _validate_bucket(bucket)) is not None:
             return _err(msg)
         if durability is not None and (msg := _validate_durability(durability)) is not None:
@@ -447,7 +495,9 @@ def build_server() -> FastMCP:
                     "meta": meta,
                 }
             )
-        return json.dumps(out)
+        return maybe_condense(
+            json.dumps(out), intent=intent, tool_name="note_search_fts"
+        )
 
     @mcp.tool()
     def note_archive(note_id: str) -> str:
@@ -521,14 +571,22 @@ def build_server() -> FastMCP:
         )
 
     @mcp.tool()
-    def job_get(job_id: str) -> str:
-        """Fetch one QueuedJob by id, or {"ok": false, "error": "missing"}."""
+    def job_get(intent: str, job_id: str) -> str:
+        """Fetch one QueuedJob by id, or {"ok": false, "error": "missing"}.
+
+        ``intent`` (required): one short sentence on why you're reading
+        this job — used to condense the result if oversize (e.g. when a
+        chain step's ``last_summary`` is large)."""
         with get_session() as sess:
             row = sess.get(QueuedJob, job_id)
             if row is None:
                 return _err("missing")
             sess.expunge(row)
-        return json.dumps(_serialize_queued_job(row))
+        return maybe_condense(
+            json.dumps(_serialize_queued_job(row)),
+            intent=intent,
+            tool_name="job_get",
+        )
 
     @mcp.tool()
     def job_update(
@@ -600,6 +658,7 @@ def build_server() -> FastMCP:
 
     @mcp.tool()
     def job_list(
+        intent: str,
         bucket: str | None = None,
         status: str | None = None,
         recurring_only: bool = False,
@@ -609,7 +668,10 @@ def build_server() -> FastMCP:
         omit ``bucket`` to list across all buckets. ``status`` filters
         by lifecycle state (pending/claimed/completed/failed/stopped).
         ``recurring_only=True`` keeps only rows with a non-null
-        recurrence cron."""
+        recurrence cron.
+
+        ``intent`` (required): one short sentence on what you're looking
+        for — used to condense the result if oversize."""
         if bucket is not None and (msg := _validate_bucket(bucket)) is not None:
             return _err(msg)
         if limit < 1:
@@ -625,7 +687,11 @@ def build_server() -> FastMCP:
             stmt = stmt.order_by(QueuedJob.created_at.desc()).limit(limit)
             rows = list(sess.execute(stmt).scalars().all())
             sess.expunge_all()
-        return json.dumps([_serialize_queued_job(j) for j in rows])
+        return maybe_condense(
+            json.dumps([_serialize_queued_job(j) for j in rows]),
+            intent=intent,
+            tool_name="job_list",
+        )
 
     # ----------------------------------------------- agent result inbox
 
@@ -668,18 +734,24 @@ def build_server() -> FastMCP:
         "error": "..."}`` on validation failure (token must be a
         non-empty string, report/summary must be strings).
         """
-        if not isinstance(result_token, str) or not result_token.strip():
+        # The runtime ``isinstance`` checks below defend against malformed
+        # MCP calls (the schema declares ``str`` but a buggy host could
+        # still pass a number or null). Pyright sees the annotation and
+        # flags the checks as unnecessary; the suppressions keep the
+        # defensive guards in place. Same pattern in the other submit_*
+        # tools below.
+        if not isinstance(result_token, str) or not result_token.strip():  # pyright: ignore[reportUnnecessaryIsInstance]
             return _err("result_token must be a non-empty string")
-        if not isinstance(report, str):
+        if not isinstance(report, str):  # pyright: ignore[reportUnnecessaryIsInstance]
             return _err("report must be a string")
-        if not isinstance(summary, str):
+        if not isinstance(summary, str):  # pyright: ignore[reportUnnecessaryIsInstance]
             return _err("summary must be a string")
         produces_dict: dict[str, Any] = produces or {}
-        if not isinstance(produces_dict, dict):
+        if not isinstance(produces_dict, dict):  # pyright: ignore[reportUnnecessaryIsInstance]
             return _err("produces must be an object (or omitted)")
-        if error is not None and not isinstance(error, str):
+        if error is not None and not isinstance(error, str):  # pyright: ignore[reportUnnecessaryIsInstance]
             return _err("error must be a string or omitted")
-        error_value = error.strip() if isinstance(error, str) else None
+        error_value = error.strip() if isinstance(error, str) else None  # pyright: ignore[reportUnnecessaryIsInstance]
         if error_value == "":
             error_value = None
         result_inbox.deposit(
@@ -711,9 +783,9 @@ def build_server() -> FastMCP:
           tasque to post to the bucket's thread, or ``None`` (the
           common case) for a quiet run.
         """
-        if not isinstance(result_token, str) or not result_token.strip():
+        if not isinstance(result_token, str) or not result_token.strip():  # pyright: ignore[reportUnnecessaryIsInstance]
             return _err("result_token must be a non-empty string")
-        if thread_post is not None and not isinstance(thread_post, str):
+        if thread_post is not None and not isinstance(thread_post, str):  # pyright: ignore[reportUnnecessaryIsInstance]
             return _err("thread_post must be a string or null")
         result_inbox.deposit(
             result_token=result_token,
@@ -757,9 +829,9 @@ def build_server() -> FastMCP:
         ``seconds=600`` doesn't grant 1200s; the larger of the two
         ``now + seconds`` deadlines wins.
         """
-        if not isinstance(seconds, int) or seconds <= 0:
+        if not isinstance(seconds, int) or seconds <= 0:  # pyright: ignore[reportUnnecessaryIsInstance]
             return _err("seconds must be a positive integer")
-        if not isinstance(reason, str) or not reason.strip():
+        if not isinstance(reason, str) or not reason.strip():  # pyright: ignore[reportUnnecessaryIsInstance]
             return _err("reason must be a non-empty string")
         request_id = os.environ.get("TASQUE_PROXY_REQUEST_ID")
         base_url = os.environ.get("TASQUE_PROXY_INTERNAL_URL")
@@ -791,10 +863,13 @@ def build_server() -> FastMCP:
                 err_body = json.loads(exc.read().decode("utf-8"))
             except Exception:
                 err_body = {"message": str(exc)}
-            return _err(
-                f"proxy returned HTTP {exc.code}: "
-                f"{(err_body.get('error') or {}).get('message', err_body)}"
+            err_obj = err_body.get("error") if isinstance(err_body, dict) else None
+            err_msg = (
+                err_obj.get("message", err_body)
+                if isinstance(err_obj, dict)
+                else err_body
             )
+            return _err(f"proxy returned HTTP {exc.code}: {err_msg}")
         except Exception as exc:
             return _err(f"proxy unreachable: {type(exc).__name__}: {exc}")
         return _ok(
@@ -825,10 +900,10 @@ def build_server() -> FastMCP:
         Empty list is the right answer when the failure is terminal
         and nothing remediates it. Pass an empty list, not null.
         """
-        if not isinstance(result_token, str) or not result_token.strip():
+        if not isinstance(result_token, str) or not result_token.strip():  # pyright: ignore[reportUnnecessaryIsInstance]
             return _err("result_token must be a non-empty string")
         muts = mutations if mutations is not None else []
-        if not isinstance(muts, list):
+        if not isinstance(muts, list):  # pyright: ignore[reportUnnecessaryIsInstance]
             return _err("mutations must be a list (or omitted)")
         result_inbox.deposit(
             result_token=result_token,
@@ -865,20 +940,20 @@ def build_server() -> FastMCP:
 
         Pass empty lists (not null) for sections you don't need.
         """
-        if not isinstance(result_token, str) or not result_token.strip():
+        if not isinstance(result_token, str) or not result_token.strip():  # pyright: ignore[reportUnnecessaryIsInstance]
             return _err("result_token must be a non-empty string")
-        if not isinstance(summary, str) or not summary.strip():
+        if not isinstance(summary, str) or not summary.strip():  # pyright: ignore[reportUnnecessaryIsInstance]
             return _err("summary must be a non-empty string")
         new_aims_list = new_aims if new_aims is not None else []
         signals_list = signals if signals is not None else []
         status_changes_list = (
             aim_status_changes if aim_status_changes is not None else []
         )
-        if not isinstance(new_aims_list, list):
+        if not isinstance(new_aims_list, list):  # pyright: ignore[reportUnnecessaryIsInstance]
             return _err("new_aims must be a list (or omitted)")
-        if not isinstance(signals_list, list):
+        if not isinstance(signals_list, list):  # pyright: ignore[reportUnnecessaryIsInstance]
             return _err("signals must be a list (or omitted)")
-        if not isinstance(status_changes_list, list):
+        if not isinstance(status_changes_list, list):  # pyright: ignore[reportUnnecessaryIsInstance]
             return _err("aim_status_changes must be a list (or omitted)")
         result_inbox.deposit(
             result_token=result_token,
@@ -923,27 +998,43 @@ def build_server() -> FastMCP:
         return _ok(chain_name=name)
 
     @mcp.tool()
-    def chain_template_get(name: str) -> str:
+    def chain_template_get(intent: str, name: str) -> str:
         """Fetch one ChainTemplate by ``chain_name`` (full plan dict
-        included), or {"ok": false, "error": "missing"}."""
+        included), or {"ok": false, "error": "missing"}.
+
+        ``intent`` (required): one short sentence on why you're reading
+        this template — used to condense the result if oversize (large
+        plans with many steps can blow past the threshold)."""
         row = _get_template(name)
         if row is None:
             return _err("missing")
-        return json.dumps(row, default=str)
+        return maybe_condense(
+            json.dumps(row, default=str),
+            intent=intent,
+            tool_name="chain_template_get",
+        )
 
     @mcp.tool()
     def chain_template_list(
+        intent: str,
         bucket: str | None = None,
         enabled_only: bool = False,
     ) -> str:
         """List all ChainTemplates as a JSON array. Optionally filter by
-        ``bucket`` and/or ``enabled_only=True``."""
+        ``bucket`` and/or ``enabled_only=True``.
+
+        ``intent`` (required): one short sentence on what you're looking
+        for — used to condense the result if oversize."""
         if bucket is not None and (msg := _validate_bucket(bucket)) is not None:
             return _err(msg)
         rows = _list_templates(enabled_only=enabled_only)
         if bucket is not None:
             rows = [r for r in rows if r.get("bucket") == bucket]
-        return json.dumps(rows, default=str)
+        return maybe_condense(
+            json.dumps(rows, default=str),
+            intent=intent,
+            tool_name="chain_template_list",
+        )
 
     @mcp.tool()
     def chain_template_update(
@@ -1072,11 +1163,20 @@ def build_server() -> FastMCP:
         return _ok(chain_id=chain_id)
 
     @mcp.tool()
-    def chain_run_get(chain_id: str, include_state: bool = False) -> str:
+    def chain_run_get(
+        intent: str,
+        chain_id: str,
+        include_state: bool = False,
+    ) -> str:
         """Fetch one ChainRun row by ``chain_id``. With
         ``include_state=True`` also includes the live checkpoint state
         (plan, completed, failures, history) under a ``state`` key.
-        Returns {"ok": false, "error": "missing"} if no such run."""
+        Returns {"ok": false, "error": "missing"} if no such run.
+
+        ``intent`` (required): one short sentence on what you're reading
+        the run for (e.g. 'is the resume step blocked', 'which fan-out
+        children failed') — used to condense the result if oversize.
+        ``include_state=True`` payloads regularly cross the threshold."""
         with get_session() as sess:
             stmt = select(ChainRun).where(ChainRun.chain_id == chain_id)
             row = sess.execute(stmt).scalars().first()
@@ -1087,17 +1187,25 @@ def build_server() -> FastMCP:
         if include_state:
             state = _get_chain_state(chain_id)
             out["state"] = state
-        return json.dumps(out, default=str)
+        return maybe_condense(
+            json.dumps(out, default=str),
+            intent=intent,
+            tool_name="chain_run_get",
+        )
 
     @mcp.tool()
     def chain_run_list(
+        intent: str,
         bucket: str | None = None,
         status: str | None = None,
         limit: int = 20,
     ) -> str:
         """List ChainRuns, newest first. Optional filters: ``bucket``,
         ``status`` (running/completed/failed/stopped/awaiting_approval/
-        awaiting_user/paused)."""
+        awaiting_user/paused).
+
+        ``intent`` (required): one short sentence on what you're looking
+        for — used to condense the result if oversize."""
         if bucket is not None and (msg := _validate_bucket(bucket)) is not None:
             return _err(msg)
         if limit < 1:
@@ -1111,7 +1219,11 @@ def build_server() -> FastMCP:
             stmt = stmt.order_by(ChainRun.created_at.desc()).limit(limit)
             rows = list(sess.execute(stmt).scalars().all())
             sess.expunge_all()
-        return json.dumps([_serialize_chain_run(r) for r in rows])
+        return maybe_condense(
+            json.dumps([_serialize_chain_run(r) for r in rows]),
+            intent=intent,
+            tool_name="chain_run_list",
+        )
 
     @mcp.tool()
     def chain_run_pause(chain_id: str) -> str:
@@ -1187,10 +1299,16 @@ def build_server() -> FastMCP:
             expires_at=expires_at,
         )
         written = write_entity(s)
+        dispatch_tool_event(
+            "signal_create",
+            from_bucket=from_bucket,
+            to_bucket=to_bucket,
+        )
         return _ok(id=written.id)
 
     @mcp.tool()
     def signal_list(
+        intent: str,
         to_bucket: str | None = None,
         include_archived: bool = False,
         limit: int = 20,
@@ -1200,7 +1318,10 @@ def build_server() -> FastMCP:
         With ``to_bucket`` set, returns active signals addressed to that
         bucket (and any broadcast to ``"all"``). With ``to_bucket=None``,
         returns the most recent signals across every from/to pairing —
-        the cross-bucket view used by the strategist."""
+        the cross-bucket view used by the strategist.
+
+        ``intent`` (required): one short sentence on what you're looking
+        for — used to condense the result if oversize."""
         if (
             to_bucket is not None
             and to_bucket != "all"
@@ -1220,7 +1341,11 @@ def build_server() -> FastMCP:
             stmt = stmt.order_by(Signal.created_at.desc()).limit(limit)
             rows = list(sess.execute(stmt).scalars().all())
             sess.expunge_all()
-        return json.dumps([_serialize_signal(s) for s in rows])
+        return maybe_condense(
+            json.dumps([_serialize_signal(s) for s in rows]),
+            intent=intent,
+            tool_name="signal_list",
+        )
 
     @mcp.tool()
     def signal_archive(signal_id: str) -> str:
@@ -1274,17 +1399,30 @@ def build_server() -> FastMCP:
             source=source,
         )
         written = write_entity(a)
+        dispatch_tool_event(
+            "aim_create",
+            bucket=bucket_value,
+            scope=scope,
+        )
         return _ok(id=written.id)
 
     @mcp.tool()
-    def aim_get(aim_id: str) -> str:
-        """Fetch one Aim by id, or {"ok": false, "error": "missing"}."""
+    def aim_get(intent: str, aim_id: str) -> str:
+        """Fetch one Aim by id, or {"ok": false, "error": "missing"}.
+
+        ``intent`` (required): one short sentence on why you're reading
+        this aim — used to condense the result if oversize (long-term
+        aims with verbose descriptions occasionally cross the threshold)."""
         with get_session() as sess:
             row = sess.get(Aim, aim_id)
             if row is None:
                 return _err("missing")
             sess.expunge(row)
-        return json.dumps(_serialize_aim(row))
+        return maybe_condense(
+            json.dumps(_serialize_aim(row)),
+            intent=intent,
+            tool_name="aim_get",
+        )
 
     @mcp.tool()
     def aim_update(
@@ -1320,6 +1458,7 @@ def build_server() -> FastMCP:
 
     @mcp.tool()
     def aim_list(
+        intent: str,
         scope: str | None = None,
         bucket: str | None = None,
         status: str | None = None,
@@ -1328,7 +1467,10 @@ def build_server() -> FastMCP:
         """Return Aims as a JSON array (newest first). All filters
         optional. ``scope`` is "long_term" or "bucket". ``bucket`` is
         one of the nine canonical buckets. ``status`` is "active",
-        "completed", or "dropped"."""
+        "completed", or "dropped".
+
+        ``intent`` (required): one short sentence on what you're looking
+        for — used to condense the result if oversize."""
         if scope is not None and scope not in ("long_term", "bucket"):
             return _err(f"scope must be 'long_term' or 'bucket', got {scope!r}")
         if bucket is not None and (msg := _validate_bucket(bucket)) is not None:
@@ -1350,16 +1492,25 @@ def build_server() -> FastMCP:
             stmt = stmt.order_by(Aim.created_at.desc()).limit(limit)
             rows = list(sess.execute(stmt).scalars().all())
             sess.expunge_all()
-        return json.dumps([_serialize_aim(a) for a in rows])
+        return maybe_condense(
+            json.dumps([_serialize_aim(a) for a in rows]),
+            intent=intent,
+            tool_name="aim_list",
+        )
 
     # ------------------------------------------------- cross-bucket view
 
     @mcp.tool()
-    def bucket_summary() -> str:
+    def bucket_summary(intent: str) -> str:
         """One-line per-bucket snapshot across all nine buckets:
         active aim count, pending job count, unresolved failure count,
         and signal count (in or out, unarchived). Returns a JSON object
-        keyed by bucket name."""
+        keyed by bucket name.
+
+        ``intent`` (required): one short sentence on what you're looking
+        for — used to condense the result if oversize (the snapshot is
+        almost always under the threshold but agents should still write
+        the intent so the API stays uniform)."""
         out: dict[str, dict[str, int]] = {}
         with get_session() as sess:
             for b in ALL_BUCKETS:
@@ -1388,7 +1539,9 @@ def build_server() -> FastMCP:
                     "signals": len(list(sigs)),
                 }
             sess.expunge_all()
-        return json.dumps(out)
+        return maybe_condense(
+            json.dumps(out), intent=intent, tool_name="bucket_summary"
+        )
 
     # The @mcp.tool() decorator registers each function on ``mcp`` as a
     # side effect; pyright's reportUnusedFunction can't see that, so we

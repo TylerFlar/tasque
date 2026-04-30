@@ -110,7 +110,7 @@ def configure_logging(*, level: str = _DEFAULT_LEVEL, force: bool = False) -> No
         cache_logger_on_first_use=True,
     )
 
-    configure_logging._done = True
+    setattr(configure_logging, "_done", True)  # noqa: B010
 
 
 __all__ = ["configure_logging"]

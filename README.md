@@ -190,6 +190,17 @@ Register it once:
 (Or omit `uv` and use a virtualenv-relative path to the `tasque`
 console script — whichever spawns the right venv.)
 
+Read tools take a required `intent` argument (one short sentence: "what
+you're looking for from this call"). When the raw JSON response exceeds
+the configured threshold (default ~60 KB; override via
+`TASQUE_MCP_CONDENSE_THRESHOLD`), the result is condensed by a haiku
+call using `intent` as the filter and returned wrapped in
+`{"_condensed": true, "_intent": "...", "_original_bytes": N,
+"summary": "..."}`. Under the threshold the original payload is
+returned verbatim. Condensation is best-effort — if the haiku call
+fails, the original is returned. Write tools and the `submit_*` /
+`claim_idle_silence` tools do not take `intent`.
+
 Tools exposed (full schemas are emitted on connect — your MCP host
 will list them):
 
@@ -289,9 +300,14 @@ and is concatenated at request time, so per-bucket files only carry the
 mindset.
 
 The coach is fired exclusively through a single SQLite-backed trigger
-queue. Worker completion, Discord replies, and scheduled wakes all
-`enqueue(bucket, reason, dedup_key)`; the drainer claims rows serially
-per bucket and runs the coach LangGraph. Dedup is two-phase against
+queue. Worker completion, Discord replies, scheduled wakes, and MCP
+tool execution all `enqueue(bucket, reason, dedup_key)`; the drainer
+claims rows serially per bucket and runs the coach LangGraph. The
+MCP-tool source covers cases where another Claude session (or the user
+via an MCP host) writes a Note, sends a Signal, or creates a
+bucket-scoped Aim through tasque MCP — see
+[src/tasque/mcp/tool_triggers.py](src/tasque/mcp/tool_triggers.py)
+for the dispatch table. Dedup is two-phase against
 `(bucket, dedup_key)`:
 
 - **Pending**: any unclaimed pending row collapses the new enqueue
