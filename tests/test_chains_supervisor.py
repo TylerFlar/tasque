@@ -26,6 +26,7 @@ def _node(**kwargs: Any) -> PlanNode:
         "depends_on": [],
         "consumes": [],
         "fan_out_on": None,
+        "fan_out_concurrency": None,
         "status": "pending",
         "origin": "spec",
         "on_failure": "halt",
@@ -271,6 +272,120 @@ def test_supervisor_promotes_downstream_after_all_fan_out_children_completed() -
     update = supervisor({"plan": plan, "completed": completed, "failures": {}})
     notify = next(n for n in update["plan"] if n["id"] == "notify")
     assert notify["status"] == "running"
+
+
+# --------------------------------------------------- fan_out_concurrency
+
+def test_fan_out_concurrency_caps_initial_promotion() -> None:
+    """A fan-out with concurrency=1 should only promote one child to
+    running on the first supervisor pass even when several children are
+    materialized at once and all their deps are satisfied."""
+    plan = [
+        _node(id="scan", status="completed"),
+        _node(
+            id="dispatch",
+            depends_on=["scan"],
+            consumes=["scan"],
+            fan_out_on="items",
+            fan_out_concurrency=1,
+        ),
+    ]
+    completed = {"scan": {"report": "ok", "produces": {"items": ["a", "b", "c"]}}}
+    update = supervisor({"plan": plan, "completed": completed, "failures": {}})
+    new_plan = update["plan"]
+    children = [n for n in new_plan if n["id"].startswith("dispatch[")]
+    assert len(children) == 3
+    running = [c for c in children if c["status"] == "running"]
+    pending = [c for c in children if c["status"] == "pending"]
+    assert len(running) == 1
+    assert len(pending) == 2
+
+
+def test_fan_out_concurrency_inherits_to_children() -> None:
+    """Children should carry the template's concurrency value so the
+    supervisor can read it during later promotion passes (when the
+    template node is already completed and unhelpful)."""
+    plan = [
+        _node(id="scan", status="completed"),
+        _node(
+            id="dispatch",
+            depends_on=["scan"],
+            consumes=["scan"],
+            fan_out_on="items",
+            fan_out_concurrency=2,
+        ),
+    ]
+    completed = {"scan": {"report": "ok", "produces": {"items": [1, 2, 3]}}}
+    update = supervisor({"plan": plan, "completed": completed, "failures": {}})
+    children = [n for n in update["plan"] if n["id"].startswith("dispatch[")]
+    assert all(c["fan_out_concurrency"] == 2 for c in children)
+
+
+def test_fan_out_concurrency_promotes_next_after_sibling_completes() -> None:
+    """Once one running child finishes, the next supervisor pass should
+    promote one more pending child — never exceeding the cap."""
+    plan = [
+        _node(id="scan", status="completed"),
+        _node(
+            id="dispatch",
+            depends_on=["scan"],
+            consumes=["scan"],
+            fan_out_on="items",
+            fan_out_concurrency=1,
+            status="completed",
+        ),
+        _node(
+            id="dispatch[0]",
+            depends_on=["scan"],
+            consumes=["scan"],
+            fan_out_on=None,
+            fan_out_concurrency=1,
+            fan_out_index=0,
+            fan_out_item="a",
+            status="running",
+        ),
+        _node(
+            id="dispatch[1]",
+            depends_on=["scan"],
+            consumes=["scan"],
+            fan_out_on=None,
+            fan_out_concurrency=1,
+            fan_out_index=1,
+            fan_out_item="b",
+            status="pending",
+        ),
+    ]
+    # First sibling completed; reconcile should promote it, then promotion
+    # step sees 0 running siblings and is free to promote one pending.
+    completed = {
+        "scan": {"report": "ok", "produces": {"items": ["a", "b"]}},
+        "dispatch[0]": {"report": "ok", "produces": {}},
+    }
+    update = supervisor({"plan": plan, "completed": completed, "failures": {}})
+    new_plan = update["plan"]
+    by_id = {n["id"]: n for n in new_plan}
+    assert by_id["dispatch[0]"]["status"] == "completed"
+    assert by_id["dispatch[1]"]["status"] == "running"
+
+
+def test_fan_out_concurrency_none_means_unbounded() -> None:
+    """The default behaviour (concurrency=None) must remain unbounded —
+    every materialized child is promoted at once."""
+    plan = [
+        _node(id="scan", status="completed"),
+        _node(
+            id="dispatch",
+            depends_on=["scan"],
+            consumes=["scan"],
+            fan_out_on="items",
+            # fan_out_concurrency omitted — defaults to None via _node's base
+        ),
+    ]
+    completed = {"scan": {"report": "ok", "produces": {"items": [1, 2, 3, 4]}}}
+    update = supervisor({"plan": plan, "completed": completed, "failures": {}})
+    children = [n for n in update["plan"] if n["id"].startswith("dispatch[")]
+    assert len(children) == 4
+    assert all(c["status"] == "running" for c in children)
 
 
 # ----------------------------------------------------------- routing

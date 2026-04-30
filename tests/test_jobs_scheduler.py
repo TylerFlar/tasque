@@ -401,5 +401,41 @@ def test_start_scheduler_starts_and_shuts_down() -> None:
     sched = scheduler_mod.start_scheduler(tick_seconds=60)
     try:
         assert sched.running is True
+        # The agent-result inbox reaper must be wired in alongside the
+        # other periodic jobs — without it, leaked rows from crashed
+        # agent runs accumulate forever.
+        job_ids = {j.id for j in sched.get_jobs()}
+        assert "tasque-agent-results-reap" in job_ids
     finally:
         sched.shutdown(wait=False)
+
+
+def test_reap_agent_results_safe_invokes_reaper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wrapper used by APScheduler must call result_inbox.reap_stale
+    and never let an exception propagate up into the scheduler thread."""
+    from tasque.agents import result_inbox
+
+    calls: list[None] = []
+
+    def _fake_reap(*, max_age_seconds: int = result_inbox.DEFAULT_REAP_AGE_SECONDS) -> int:
+        calls.append(None)
+        return 0
+
+    monkeypatch.setattr(result_inbox, "reap_stale", _fake_reap)
+    scheduler_mod._reap_agent_results_safe()
+    assert calls == [None]
+
+
+def test_reap_agent_results_safe_swallows_exceptions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tasque.agents import result_inbox
+
+    def _boom(*, max_age_seconds: int = result_inbox.DEFAULT_REAP_AGE_SECONDS) -> int:
+        raise RuntimeError("db went away")
+
+    monkeypatch.setattr(result_inbox, "reap_stale", _boom)
+    # Must not raise — APScheduler thread would otherwise die silently.
+    scheduler_mod._reap_agent_results_safe()

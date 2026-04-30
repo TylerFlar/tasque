@@ -14,36 +14,21 @@ import pytest
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import ValidationError
 
+from tasque.agents import result_inbox
 from tasque.coach.graph import (
     _build_prompt,
     _gather_context,
     _parse_response,
     run_bucket_coach,
 )
-from tasque.coach.output import BucketCoachOutput, extract_json_block
+from tasque.coach.output import BucketCoachOutput
 from tasque.coach.persist import persist_results
 from tasque.memory.entities import Note, QueuedJob, Signal
 from tasque.memory.repo import write_entity
 
-from .conftest import make_canned_chat_model
+from .conftest import make_coach_result_chat_model
 
 # ---------------------------------------------------------------- output
-
-def test_extract_json_block_fenced() -> None:
-    body = '{"thread_post": "hello"}'
-    text = f"some preamble\n```json\n{body}\n```\nepilogue"
-    extracted = extract_json_block(text)
-    assert extracted is not None
-    parsed = BucketCoachOutput.model_validate_json(extracted)
-    assert parsed.thread_post == "hello"
-
-
-def test_extract_json_block_unfenced_fallback() -> None:
-    body = '{"thread_post": null}'
-    text = f"hi {body} bye"
-    extracted = extract_json_block(text)
-    assert extracted == body
-
 
 def test_bucket_coach_output_rejects_extra_fields() -> None:
     bad = json.dumps({"thread_post": None, "smuggled": "nope"})
@@ -164,6 +149,13 @@ def test_build_prompt_includes_scaffold_bucket_state_and_time(
     assert "## Run context" in user_text
     assert "Bucket: health" in user_text
     assert "manual ping" in user_text
+    # The fresh result_token must be embedded so the LLM can pass it
+    # back to submit_coach_result.
+    assert "result_token:" in user_text
+    assert "submit_coach_result" in user_text
+    # And it must be propagated as state so _parse_response can read
+    # the inbox row keyed on the same token.
+    assert isinstance(out.get("result_token"), str) and out["result_token"]
     # Durable content does NOT appear in the prompt; only the count + a hint.
     assert "hydrate" not in user_text
     assert "1 present in this bucket" in user_text
@@ -176,31 +168,57 @@ def test_build_prompt_includes_scaffold_bucket_state_and_time(
 
 # --------------------------------------------------------- parse_response
 
-def test_parse_response_extracts_and_validates() -> None:
-    payload = {"thread_post": "queued one new task"}
-    raw = "preface\n```json\n" + json.dumps(payload) + "\n```\ntail"
-    out = _parse_response({"bucket": "health", "raw_response": raw})
+def test_parse_response_reads_inbox_and_validates() -> None:
+    token = result_inbox.mint_token()
+    result_inbox.deposit(
+        result_token=token,
+        agent_kind="coach",
+        payload={"thread_post": "queued one new task"},
+    )
+    out = _parse_response({"bucket": "health", "result_token": token})
     parsed = out.get("parsed")
     assert parsed is not None
     assert parsed.thread_post == "queued one new task"
 
 
 def test_parse_response_accepts_null_thread_post() -> None:
-    raw = "```json\n" + json.dumps({"thread_post": None}) + "\n```"
-    out = _parse_response({"bucket": "health", "raw_response": raw})
+    token = result_inbox.mint_token()
+    result_inbox.deposit(
+        result_token=token,
+        agent_kind="coach",
+        payload={"thread_post": None},
+    )
+    out = _parse_response({"bucket": "health", "result_token": token})
     parsed = out.get("parsed")
     assert parsed is not None
     assert parsed.thread_post is None
 
 
-def test_parse_response_errors_on_missing_block() -> None:
-    out = _parse_response({"bucket": "health", "raw_response": "no JSON here"})
+def test_parse_response_errors_when_tool_not_called() -> None:
+    """An empty inbox means the coach LLM never called
+    submit_coach_result during its turn."""
+    token = result_inbox.mint_token()
+    out = _parse_response({"bucket": "health", "result_token": token})
     assert "error" in out
+    assert "submit_coach_result" in out["error"]
 
 
-def test_parse_response_errors_on_malformed_json() -> None:
-    raw = "```json\n{not real json}\n```"
-    out = _parse_response({"bucket": "health", "raw_response": raw})
+def test_parse_response_errors_on_missing_token() -> None:
+    out = _parse_response({"bucket": "health"})
+    assert "error" in out
+    assert "result_token" in out["error"]
+
+
+def test_parse_response_errors_on_invalid_payload() -> None:
+    """A coach payload with extra fields fails BucketCoachOutput
+    validation — surfaced as an error rather than silently dropped."""
+    token = result_inbox.mint_token()
+    result_inbox.deposit(
+        result_token=token,
+        agent_kind="coach",
+        payload={"thread_post": None, "smuggled": "nope"},
+    )
+    out = _parse_response({"bucket": "health", "result_token": token})
     assert "error" in out
 
 
@@ -225,7 +243,9 @@ def test_run_bucket_coach_end_to_end_with_fake_llm() -> None:
     write_entity(
         Note(content="seed note", bucket="health", durability="durable", source="user")
     )
-    fake = make_canned_chat_model([{"thread_post": "ran without anything to announce"}])
+    fake = make_coach_result_chat_model(
+        [{"thread_post": "ran without anything to announce"}]
+    )
     final = run_bucket_coach("health", reason="test", llm=fake)
     persisted = final.get("persisted") or {}
     assert persisted.get("thread_post") == "ran without anything to announce"
@@ -233,7 +253,86 @@ def test_run_bucket_coach_end_to_end_with_fake_llm() -> None:
 
 
 def test_run_bucket_coach_end_to_end_null_post() -> None:
-    fake = make_canned_chat_model([{"thread_post": None}])
+    fake = make_coach_result_chat_model([{"thread_post": None}])
     final = run_bucket_coach("health", reason="test", llm=fake)
     persisted = final.get("persisted") or {}
     assert persisted.get("thread_post") is None
+
+
+# ----------------------------------------------- post-reply tool gating
+
+def test_build_prompt_replies_with_post_reply_guidance() -> None:
+    """When fired by the Discord router's post-reply trigger
+    (reason="reply"), the prompt must NOT instruct the bucket coach to
+    fire chains / queue jobs — the synchronous reply already had that
+    chance, and a duplicate fire is the bug we're fixing."""
+    out = _build_prompt({"bucket": "health", "reason": "reply"})
+    user_text = str((out["messages"] or [])[1].content)
+    assert "Post-reply pass" in user_text
+    assert "synchronous reply" in user_text
+    # Disabled action tools must be named so the LLM doesn't try them.
+    assert "chain_fire_template" in user_text
+    assert "do not attempt them" in user_text
+
+
+def test_build_prompt_non_reply_keeps_full_action_surface() -> None:
+    out = _build_prompt({"bucket": "health", "reason": "scheduled"})
+    user_text = str((out["messages"] or [])[1].content)
+    # Standard run still tells the coach it can write via MCP.
+    assert "note_create" in user_text
+    assert "Post-reply pass" not in user_text
+
+
+def test_call_llm_passes_disallowed_tools_when_reply_trigger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``run_bucket_coach`` with reason='reply' must build the LLM with
+    the chain-fire / queue / job-create tools denylisted, so the
+    proxy → claude --print path can't double-fire on the user's request."""
+    from langchain_core.messages import AIMessage
+
+    from tasque.coach import graph as coach_graph
+
+    captured: dict[str, Any] = {}
+
+    class _FakeLLM:
+        def invoke(self, messages: list[Any]) -> AIMessage:
+            return AIMessage(content="{}")
+
+    def fake_factory(agent_kind: str, **kwargs: Any) -> _FakeLLM:
+        captured["agent_kind"] = agent_kind
+        captured["kwargs"] = kwargs
+        return _FakeLLM()
+
+    monkeypatch.setattr(coach_graph, "get_chat_model", fake_factory)
+    coach_graph._call_llm({"bucket": "health", "reason": "reply", "messages": []})
+    assert captured["agent_kind"] == "coach"
+    assert captured["kwargs"].get("disallowed_tools") == [
+        "mcp__tasque__chain_fire_template",
+        "mcp__tasque__chain_queue_adhoc",
+        "mcp__tasque__job_create",
+    ]
+
+
+def test_call_llm_omits_disallowed_tools_for_non_reply_triggers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from langchain_core.messages import AIMessage
+
+    from tasque.coach import graph as coach_graph
+
+    captured: dict[str, Any] = {}
+
+    class _FakeLLM:
+        def invoke(self, messages: list[Any]) -> AIMessage:
+            return AIMessage(content="{}")
+
+    def fake_factory(agent_kind: str, **kwargs: Any) -> _FakeLLM:
+        captured["kwargs"] = kwargs
+        return _FakeLLM()
+
+    monkeypatch.setattr(coach_graph, "get_chat_model", fake_factory)
+    coach_graph._call_llm(
+        {"bucket": "health", "reason": "job-completed:abc", "messages": []}
+    )
+    assert captured["kwargs"].get("disallowed_tools") is None

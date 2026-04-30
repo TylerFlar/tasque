@@ -92,29 +92,64 @@ def _proxy_api_key() -> str:
     return os.environ.get("TASQUE_PROXY_API_KEY", DEFAULT_PROXY_API_KEY)
 
 
-def _build_chat(model_id: str, **kwargs: Any) -> ChatOpenAI:
+def _build_chat(
+    model_id: str,
+    *,
+    disallowed_tools: list[str] | None = None,
+    **kwargs: Any,
+) -> ChatOpenAI:
     params: dict[str, Any] = {
         "model": model_id,
         "base_url": _proxy_base_url(),
         "api_key": _proxy_api_key(),
     }
+    if disallowed_tools:
+        # Forwarded to the tasque proxy as a vendor extension; the proxy
+        # turns it into ``claude --print --disallowedTools <comma-list>``.
+        existing_extra = kwargs.pop("extra_body", None) or {}
+        if not isinstance(existing_extra, dict):
+            existing_extra = {}
+        params["extra_body"] = {
+            **existing_extra,
+            "disallowed_tools": list(disallowed_tools),
+        }
     params.update(kwargs)
     return ChatOpenAI(**params)
 
 
-def get_chat_model(agent_kind: AgentKind, **kwargs: Any) -> ChatOpenAI:
+def get_chat_model(
+    agent_kind: AgentKind,
+    *,
+    disallowed_tools: list[str] | None = None,
+    **kwargs: Any,
+) -> ChatOpenAI:
     """Return a ``ChatOpenAI`` configured against the local proxy.
 
     ``**kwargs`` are forwarded to ``ChatOpenAI`` for one-off tweaks
     (``temperature``, ``max_tokens``, etc.). Per-agent temperature/max-token
     env vars are intentionally not provided — set them at the call site.
+
+    ``disallowed_tools`` is a per-call denylist forwarded to the tasque
+    proxy and on to ``claude --print --disallowedTools``. Use it when a
+    call site must not invoke certain MCP tools (e.g. the bucket coach's
+    post-reply trigger excluding chain-fire tools the synchronous reply
+    has already exercised).
     """
     if agent_kind not in ALL_AGENT_KINDS:
         raise ValueError(f"unknown agent kind: {agent_kind!r}")
-    return _build_chat(resolve_model_id(agent_kind), **kwargs)
+    return _build_chat(
+        resolve_model_id(agent_kind),
+        disallowed_tools=disallowed_tools,
+        **kwargs,
+    )
 
 
-def get_chat_model_for_tier(tier: Tier, **kwargs: Any) -> ChatOpenAI:
+def get_chat_model_for_tier(
+    tier: Tier,
+    *,
+    disallowed_tools: list[str] | None = None,
+    **kwargs: Any,
+) -> ChatOpenAI:
     """Return a ``ChatOpenAI`` for ``tier`` ("opus" / "sonnet" / "haiku").
 
     Used by the worker and planner, whose tier is chosen per-row rather
@@ -123,4 +158,8 @@ def get_chat_model_for_tier(tier: Tier, **kwargs: Any) -> ChatOpenAI:
     ``PlanNode["tier"]``.
     """
     coerce_tier(tier)
-    return _build_chat(resolve_model_id_for_tier(tier), **kwargs)
+    return _build_chat(
+        resolve_model_id_for_tier(tier),
+        disallowed_tools=disallowed_tools,
+        **kwargs,
+    )

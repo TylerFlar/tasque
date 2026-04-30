@@ -1,6 +1,6 @@
 """Chain launch + cron polling + restart-recovery.
 
-Three entry points:
+Four entry points:
 
 * :func:`launch_chain_run` — seed a fresh ChainRun row + initial
   checkpoint state and synchronously invoke the graph until it
@@ -9,7 +9,16 @@ Three entry points:
   enabled templates whose cron is due, validates them, fires each.
 * :func:`resume_interrupted_chains` — startup hook. Re-invokes the
   graph for every ChainRun left in ``running`` so an unclean shutdown
-  doesn't leave a chain wedged.
+  doesn't leave a chain wedged. Also resets ``failed`` plan nodes back
+  to ``pending`` so transient errors get retried on boot.
+* :func:`resume_stale_chains` — daemon tick. Re-invokes the graph for
+  any ``running`` ChainRun whose latest checkpoint is older than
+  ``threshold_seconds``. Picks up chains whose runner thread died with
+  the calling process (e.g. an MCP-fired chain whose ``claude --print``
+  subprocess exited mid-invoke) without waiting for a daemon restart.
+  Unlike :func:`resume_interrupted_chains`, this does NOT reset failed
+  steps — running periodically with that behavior would erase legitimate
+  failure state on every tick.
 """
 
 from __future__ import annotations
@@ -38,6 +47,34 @@ from tasque.memory.db import get_session
 from tasque.memory.entities import ChainRun, ChainTemplate, utc_now_iso
 
 log = structlog.get_logger(__name__)
+
+
+# In-process registry of chain ids whose graph.invoke is currently
+# running on this process. ``resume_stale_chains`` consults this to
+# avoid double-dispatching a chain whose runner thread is alive in
+# this process but happens to be sitting inside a slow LLM turn (no
+# checkpoint update for the duration of the call). Cross-process
+# invocations whose process died are NOT in this set, so they still
+# get resumed correctly. The set is in-memory only — a daemon crash
+# clears it, which is the right semantic: any chain that was active
+# before the crash is no longer active after.
+_active_chain_invokes: set[str] = set()
+_active_chain_invokes_lock = threading.Lock()
+
+
+def _mark_invoke_active(chain_id: str) -> None:
+    with _active_chain_invokes_lock:
+        _active_chain_invokes.add(chain_id)
+
+
+def _mark_invoke_inactive(chain_id: str) -> None:
+    with _active_chain_invokes_lock:
+        _active_chain_invokes.discard(chain_id)
+
+
+def _is_invoke_active(chain_id: str) -> bool:
+    with _active_chain_invokes_lock:
+        return chain_id in _active_chain_invokes
 
 
 def _new_chain_id() -> str:
@@ -112,15 +149,19 @@ def _invoke_chain_graph(chain_id: str, initial: dict[str, Any]) -> None:
     """
     graph = get_compiled_chain_graph()
     cfg = _thread_config(chain_id)
+    _mark_invoke_active(chain_id)
     try:
-        graph.invoke(initial, cfg)
-    except Exception:
-        log.exception(
-            "chains.scheduler.launch_invoke_failed", chain_id=chain_id
-        )
-        _set_run_terminal(chain_id, status="failed")
-        return
-    maybe_finalize_status(chain_id)
+        try:
+            graph.invoke(initial, cfg)
+        except Exception:
+            log.exception(
+                "chains.scheduler.launch_invoke_failed", chain_id=chain_id
+            )
+            _set_run_terminal(chain_id, status="failed")
+            return
+        maybe_finalize_status(chain_id)
+    finally:
+        _mark_invoke_inactive(chain_id)
 
 
 def launch_chain_run(
@@ -203,15 +244,19 @@ def launch_chain_run(
         # caller see it through.
         graph = get_compiled_chain_graph()
         cfg = _thread_config(chain_id)
+        _mark_invoke_active(chain_id)
         try:
-            graph.invoke(initial, cfg)
-        except Exception:
-            log.exception(
-                "chains.scheduler.launch_invoke_failed", chain_id=chain_id
-            )
-            _set_run_terminal(chain_id, status="failed")
-            raise
-        maybe_finalize_status(chain_id)
+            try:
+                graph.invoke(initial, cfg)
+            except Exception:
+                log.exception(
+                    "chains.scheduler.launch_invoke_failed", chain_id=chain_id
+                )
+                _set_run_terminal(chain_id, status="failed")
+                raise
+            maybe_finalize_status(chain_id)
+        finally:
+            _mark_invoke_inactive(chain_id)
     else:
         # Fire-and-forget: spawn a daemon thread to run the graph and
         # return the chain_id immediately. The caller (typically the
@@ -419,29 +464,153 @@ def resume_interrupted_chains() -> list[str]:
     graph = get_compiled_chain_graph()
     for r in rows:
         cfg = _thread_config(r.chain_id)
+        _mark_invoke_active(r.chain_id)
         try:
-            reset_ids = _reset_failed_steps_for_resume(r.chain_id)
-            if reset_ids:
-                log.info(
-                    "chains.scheduler.resume_retrying_failed",
-                    chain_id=r.chain_id[:8],
-                    chain_name=r.chain_name,
-                    steps=reset_ids,
+            try:
+                reset_ids = _reset_failed_steps_for_resume(r.chain_id)
+                if reset_ids:
+                    log.info(
+                        "chains.scheduler.resume_retrying_failed",
+                        chain_id=r.chain_id[:8],
+                        chain_name=r.chain_name,
+                        steps=reset_ids,
+                    )
+                graph.invoke(cast(Any, None), cfg)
+            except Exception:
+                log.exception(
+                    "chains.scheduler.resume_failed", chain_id=r.chain_id
                 )
-            graph.invoke(cast(Any, None), cfg)
-        except Exception:
-            log.exception(
-                "chains.scheduler.resume_failed", chain_id=r.chain_id
-            )
+                continue
+            maybe_finalize_status(r.chain_id)
+        finally:
+            _mark_invoke_inactive(r.chain_id)
+        resumed.append(r.chain_id)
+    return resumed
+
+
+# Staleness threshold for ``resume_stale_chains``. The previous 30s value
+# was shorter than a normal opus dispatch turn (60-90s of LLM time during
+# which the chain's checkpoint isn't updated) and caused the resume tick
+# to re-invoke the graph mid-step, double-dispatching workers and
+# producing duplicate proposal rows. 300s is comfortably longer than any
+# single LLM turn (the proxy's stall watchdog kills the subprocess after
+# 5 min of stdout silence anyway, so a wedged in-process worker can't
+# survive longer than this without surfacing as an exception). Combined
+# with the ``_active_chain_invokes`` registry, which excludes chains
+# whose runner thread is alive in this process from staleness-based
+# resume entirely, this eliminates the mid-turn double-dispatch race.
+DEFAULT_STALE_RESUME_THRESHOLD_SECONDS = 300.0
+
+
+def _checkpoint_age_seconds(chain_id: str, *, now: datetime | None = None) -> float | None:
+    """Return seconds since the latest checkpoint write for ``chain_id``.
+
+    ``None`` means there is no checkpoint at all (the chain row exists
+    but no graph node has ever written state — treat as infinitely
+    stale by callers that want to resume aggressively, or skip if the
+    caller wants conservatism).
+    """
+    saver = get_chain_checkpointer()
+    snap = saver.get_tuple(_thread_config(chain_id))
+    if snap is None:
+        return None
+    raw_ts = snap.checkpoint.get("ts")
+    if not isinstance(raw_ts, str) or not raw_ts:
+        return None
+    try:
+        ts = datetime.fromisoformat(raw_ts)
+    except ValueError:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=UTC)
+    reference = now if now is not None else datetime.now(UTC)
+    return (reference - ts).total_seconds()
+
+
+def resume_stale_chains(
+    *,
+    threshold_seconds: float = DEFAULT_STALE_RESUME_THRESHOLD_SECONDS,
+    now: datetime | None = None,
+) -> list[str]:
+    """Re-invoke the graph for ``running`` chains whose checkpoint is stale.
+
+    ``threshold_seconds`` is the minimum checkpoint age (vs. ``now``)
+    before we step in. The daemon's tick uses this to leave actively
+    progressing chains alone — a chain currently writing checkpoints
+    has a fresh ``ts`` and is skipped.
+
+    Two layers of guard against false-positive resumes:
+
+    1. ``_active_chain_invokes`` — chains currently being run by this
+       process are skipped outright, even if their checkpoint looks
+       stale (a long LLM turn keeps the runner thread alive but doesn't
+       update the checkpoint).
+    2. ``threshold_seconds`` — for chains with no in-process owner, the
+       checkpoint must be older than the threshold. Defaults to 5 min
+       (longer than any single LLM turn the proxy permits).
+
+    Recovery path for chains whose runner thread died with the calling
+    process. Common case: the MCP server inside ``claude --print`` calls
+    ``launch_chain_run(wait=False)`` which spawns a daemon thread; that
+    thread is killed when ``claude --print`` finishes the user's turn,
+    leaving the chain in ``running`` with a stale checkpoint. The
+    periodic tick re-invokes the graph so the chain progresses without
+    needing a daemon restart.
+
+    Returns the list of resumed ``chain_id`` values. Failures during
+    invoke are logged but do not abort the loop — one bad chain doesn't
+    stop the others from progressing.
+    """
+    with get_session() as sess:
+        stmt = select(ChainRun).where(ChainRun.status == "running")
+        rows = list(sess.execute(stmt).scalars().all())
+        for r in rows:
+            sess.expunge(r)
+
+    graph = get_compiled_chain_graph()
+    resumed: list[str] = []
+    for r in rows:
+        # Skip chains whose runner thread is alive in this process — a
+        # stale checkpoint here just means the worker is mid-turn, not
+        # that the chain is wedged. Re-invoking would double-dispatch.
+        if _is_invoke_active(r.chain_id):
             continue
-        maybe_finalize_status(r.chain_id)
+        age = _checkpoint_age_seconds(r.chain_id, now=now)
+        if age is None:
+            # No checkpoint at all: the row exists but the calling
+            # process died before the graph wrote even one checkpoint.
+            # Treat as fully stale so we re-seed and run.
+            age = float("inf")
+        if age < threshold_seconds:
+            continue
+        cfg = _thread_config(r.chain_id)
+        log.info(
+            "chains.scheduler.resume_stale_invoking",
+            chain_id=r.chain_id[:8],
+            chain_name=r.chain_name,
+            age_s=round(age, 1) if age != float("inf") else None,
+        )
+        _mark_invoke_active(r.chain_id)
+        try:
+            try:
+                graph.invoke(cast(Any, None), cfg)
+            except Exception:
+                log.exception(
+                    "chains.scheduler.resume_stale_failed", chain_id=r.chain_id
+                )
+                continue
+            maybe_finalize_status(r.chain_id)
+        finally:
+            _mark_invoke_inactive(r.chain_id)
         resumed.append(r.chain_id)
     return resumed
 
 
 __all__ = [
+    "DEFAULT_STALE_RESUME_THRESHOLD_SECONDS",
     "fire_due_chain_templates",
     "launch_chain_run",
     "maybe_finalize_status",
     "resume_interrupted_chains",
+    "resume_stale_chains",
 ]

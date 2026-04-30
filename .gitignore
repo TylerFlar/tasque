@@ -55,4 +55,5 @@ coverage.xml
 Thumbs.db
 
 
-data/
+/data/
+/chains/

@@ -23,11 +23,12 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Any, NotRequired, TypedDict, cast
 
+import structlog
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 
-from tasque.coach.output import extract_json_block
+from tasque.agents import result_inbox
 from tasque.llm.factory import (
     ALL_TIERS,
     Tier,
@@ -36,24 +37,30 @@ from tasque.llm.factory import (
 from tasque.memory.entities import Note, QueuedJob
 from tasque.memory.repo import write_entity
 
+log = structlog.get_logger(__name__)
+
 if TYPE_CHECKING:
     from langgraph.graph.state import CompiledStateGraph
 
 
 WORKER_SYSTEM_PROMPT = """\
-You are a tasque worker. Execute exactly one directive and emit a
-single JSON code block. Tasque routes your output; you do not post,
-format embeds, or talk about Discord/threads/channels.
+You are a tasque worker. Execute exactly one directive and submit
+your structured result by calling ``submit_worker_result`` exactly
+once near the end of your turn. Tasque routes your output; you do
+not post, format embeds, or talk about Discord/threads/channels.
 
-Output schema (and nothing else outside this block):
+## How to return your result
 
-```json
-{
-  "report": "<full markdown body — what you did, what you observed>",
-  "summary": "<one or two sentences, max one short paragraph>",
-  "produces": { "<key>": "<value>", ... }
-}
-```
+The run context section of the user message contains a
+``result_token``. When the directive is complete, call:
+
+    submit_worker_result(
+      result_token="<value from run context>",
+      report="<full markdown body — what you did, what you observed>",
+      summary="<one or two sentences, max one short paragraph>",
+      produces={"<key>": "<value>", ...},
+      error=None,  # or "<short reason>" — see below
+    )
 
 Field roles — keep these strictly separated:
 
@@ -66,7 +73,22 @@ Field roles — keep these strictly separated:
   status flags. It is internal — only consumed by downstream chain
   steps via their ``consumes`` resolution. It is NEVER rendered to
   the user. Do not put narrative, large strings, or embed-formatting
-  payloads here.
+  payloads here. May be omitted (defaults to ``{}``) when the
+  directive doesn't hand off to anything downstream.
+- ``error``: short string identifying an application-level failure —
+  pass it when your turn completed deterministically but the
+  underlying action did not succeed (e.g. browser automation timed
+  out, external API errored, gates rejected the proposal). Leave it
+  ``None`` (the default) for normal successful runs. Setting it
+  marks THIS chain step as failed; the chain engine then applies
+  the step's ``on_failure`` policy and the overall ``ChainRun``
+  finalises as ``failed`` if any step ends up failed. Still populate
+  ``report``/``summary``/``produces`` so the user-facing thread post
+  and downstream consumers see what happened.
+
+You MUST call ``submit_worker_result`` exactly once per run. Do not
+also emit a JSON code block — your text response is ignored. If you
+forget to call the tool, the run is recorded as a worker failure.
 
 ## tasque MCP — write surface
 
@@ -93,6 +115,16 @@ your turn. Pass the bucket from the run context above on each call.
 - **Signals**: ``signal_create``, ``signal_list``, ``signal_archive``.
 - **Aims**: ``aim_get``, ``aim_list`` (workers don't typically create
   Aims — that's the strategist's job).
+- **Idle-silence claim**: ``claim_idle_silence(seconds, reason)``.
+  Call this BEFORE any tool you expect to keep stdout silent for >2
+  minutes (model training, large download, long Bash sleep, slow
+  scrape). Tasque's proxy runs a stall watchdog that kills the
+  ``claude --print`` subprocess after ~5 min of stdout silence by
+  default — without this call, a legitimate 30-min training run looks
+  identical to a hang. Honest estimate; over-budget still re-engages
+  the watchdog so genuine hangs past your estimate still get caught.
+  Returns ``{"ok": false}`` when not running under the proxy (e.g.
+  during a unit test) — safe to ignore.
 
 When you make an MCP call, capture any returned ids / structured
 results that downstream chain steps need to see, and surface them in
@@ -100,12 +132,12 @@ your ``produces`` dict. The MCP performed the write; ``produces`` is
 the structured hand-off to the next step.
 
 If your directive is purely "produce a report / data for downstream
-steps" — no side effects required — you may not need any MCP calls.
-Just return the JSON. If it requires a write, use the MCP: do not
-pretend the write happened, and do not encode it as report-text.
+steps" — no side effects required — you may not need any other MCP
+calls. Just compose the result and call ``submit_worker_result``. If
+the directive requires a write, use the MCP: do not pretend the
+write happened, and do not encode it as report-text.
 
 Stay focused on the directive. Do not pad with unrelated commentary.
-Do not output anything outside the single JSON code block.
 """
 
 
@@ -142,6 +174,7 @@ class WorkerState(TypedDict):
     job_chain_id: str | None
     job_chain_step_id: str | None
     job_tier: str
+    result_token: str
     consumes: NotRequired[dict[str, Any]]
     vars: NotRequired[dict[str, Any]]
     llm: NotRequired[BaseChatModel | None]
@@ -174,12 +207,16 @@ def _build_prompt(state: WorkerState) -> dict[str, Any]:
     bucket = state["job_bucket"] or "(no bucket)"
     reason = state["job_reason"] or "(no reason given)"
     user_text = (
-        f"Bucket: {bucket}\n"
-        f"Reason: {reason}\n"
+        "## Run context\n"
+        f"- Bucket: {bucket}\n"
+        f"- Reason: {reason}\n"
+        f"- result_token: {state['result_token']}  "
+        "(pass this to submit_worker_result)\n\n"
         f"Directive:\n{state['job_directive']}\n\n"
         f"Consumes (from previous chain step, if any):\n{_format_consumes(consumes)}\n\n"
         f"Vars (run-time overrides supplied at chain launch):\n{_format_vars(chain_vars)}\n\n"
-        "Execute the directive now and respond with the single JSON code block."
+        "Execute the directive now. When done, call submit_worker_result "
+        "exactly once with the result_token above and your structured result."
     )
     messages: list[BaseMessage] = [
         SystemMessage(content=WORKER_SYSTEM_PROMPT),
@@ -240,62 +277,62 @@ def _persist_run(state: WorkerState) -> dict[str, Any]:
     if prior is not None and prior.get("error"):
         return {"result": prior}
 
-    raw = state.get("raw_response", "")
-    block = extract_json_block(raw)
-    if block is None:
+    payload = result_inbox.read_and_consume(
+        state["result_token"], agent_kind="worker"
+    )
+    if payload is None:
         return {
             "result": WorkerResult(
                 report="",
                 summary="",
                 produces={},
-                error="no JSON block found in worker response",
+                error=(
+                    "worker did not call submit_worker_result during its turn — "
+                    "no structured result was deposited in the inbox"
+                ),
             )
         }
-    try:
-        payload = json.loads(block)
-    except json.JSONDecodeError as exc:
-        return {
-            "result": WorkerResult(
-                report="",
-                summary="",
-                produces={},
-                error=f"worker response JSON did not parse: {exc}",
-            )
-        }
-    if not isinstance(payload, dict):
-        return {
-            "result": WorkerResult(
-                report="",
-                summary="",
-                produces={},
-                error=f"worker JSON was not an object, got {type(payload).__name__}",
-            )
-        }
-    payload_d = cast(dict[str, Any], payload)
-    report_v = payload_d.get("report")
-    summary_v = payload_d.get("summary")
-    produces_v = payload_d.get("produces")
+    report_v = payload.get("report")
+    summary_v = payload.get("summary")
+    produces_v = payload.get("produces") or {}
     if not isinstance(report_v, str) or not isinstance(summary_v, str):
         return {
             "result": WorkerResult(
                 report="",
                 summary="",
                 produces={},
-                error="worker JSON missing required string fields 'report' and/or 'summary'",
+                error=(
+                    "submit_worker_result payload missing required string "
+                    "fields 'report' and/or 'summary'"
+                ),
             )
         }
-    if produces_v is None:
-        produces_v = {}
     if not isinstance(produces_v, dict):
         return {
             "result": WorkerResult(
                 report="",
                 summary="",
                 produces={},
-                error=f"worker JSON 'produces' must be an object, got {type(produces_v).__name__}",
+                error=(
+                    f"submit_worker_result 'produces' must be an object, "
+                    f"got {type(produces_v).__name__}"
+                ),
             )
         }
     produces_d = cast(dict[str, Any], produces_v)
+    # ``error`` is a worker-declared application-level failure: the turn
+    # completed deterministically (we have report/summary/produces) but
+    # the underlying action did not succeed. Surface it as the
+    # WorkerResult's error so the chain engine flips the step to failed
+    # and applies its on_failure policy. report/summary/produces stay
+    # populated so downstream consumers and the user-facing thread post
+    # still see the worker's full output.
+    error_raw = payload.get("error")
+    error_value: str | None = None
+    if isinstance(error_raw, str):
+        stripped = error_raw.strip()
+        if stripped:
+            error_value = stripped
 
     note = Note(
         content=summary_v,
@@ -309,6 +346,7 @@ def _persist_run(state: WorkerState) -> dict[str, Any]:
             "job_id": state["job_id"],
             "chain_id": state["job_chain_id"],
             "chain_step_id": state["job_chain_step_id"],
+            "worker_error": error_value,
         },
     )
     write_entity(note)
@@ -317,7 +355,7 @@ def _persist_run(state: WorkerState) -> dict[str, Any]:
             report=report_v,
             summary=summary_v,
             produces=produces_d,
-            error=None,
+            error=error_value,
         )
     }
 
@@ -389,6 +427,7 @@ def run_worker(
         "job_chain_id": job.chain_id,
         "job_chain_step_id": job.chain_step_id,
         "job_tier": job.tier,
+        "result_token": result_inbox.mint_token(),
         "consumes": consumes or {},
         "vars": vars or {},
         "llm": llm,

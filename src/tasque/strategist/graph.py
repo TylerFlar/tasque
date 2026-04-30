@@ -33,8 +33,8 @@ from langgraph.graph import END, START, StateGraph
 from pydantic import ValidationError
 from sqlalchemy import select
 
+from tasque.agents import result_inbox
 from tasque.buckets import ALL_BUCKETS, Bucket
-from tasque.coach.output import extract_json_block
 from tasque.config import get_settings
 from tasque.llm.factory import get_chat_model
 from tasque.memory.db import get_session
@@ -76,6 +76,7 @@ class StrategistState(TypedDict):
 
     reason: str
     horizon_days: NotRequired[int]
+    result_token: NotRequired[str]
     llm: NotRequired[BaseChatModel | None]
     snapshot: NotRequired[dict[str, Any]]
     messages: NotRequired[list[BaseMessage]]
@@ -291,45 +292,45 @@ def _format_time_block() -> tuple[str, str, str]:
 
 _MONITORING_OUTPUT_INSTRUCTIONS = """\
 You were invoked by a scheduled monitoring trigger (Mode 2). Read the
-cross-bucket snapshot below and produce a single fenced JSON code block
-matching this schema:
+cross-bucket snapshot below and call ``submit_strategist_result``
+exactly once with the ``result_token`` from the run context:
 
-```json
-{
-  "summary": "<markdown post body that will be sent verbatim to the strategist Discord thread>",
-  "new_aims": [
-    {
-      "title": "<aim title>",
-      "scope": "long_term" | "bucket",
-      "bucket": "<one of the 9 buckets>" | null,
-      "target_date": "YYYY-MM-DD" | null,
-      "description": "",
-      "parent_id": "<id of an existing long-term Aim>" | null
-    }
-  ],
-  "signals": [
-    {
-      "to_bucket": "<one of the 9 buckets>",
-      "kind": "aim_added" | "strategist_alert" | "rebalance" | "fyi",
-      "urgency": "low" | "normal" | "high",
-      "summary": "<one-line>",
-      "body": "<longer prose context>",
-      "expires_at": "<ISO-8601 UTC>" | null
-    }
-  ],
-  "aim_status_changes": [
-    { "aim_id": "<existing Aim id>", "status": "completed" | "dropped" | "active", "reason": "" }
-  ]
-}
-```
+    submit_strategist_result(
+      result_token="<value from run context>",
+      summary="<markdown post body sent verbatim to the strategist Discord thread>",
+      new_aims=[
+        {
+          "title": "<aim title>",
+          "scope": "long_term" | "bucket",
+          "bucket": "<one of the 9 buckets>" | None,
+          "target_date": "YYYY-MM-DD" | None,
+          "description": "",
+          "parent_id": "<id of an existing long-term Aim>" | None
+        }
+      ],
+      signals=[
+        {
+          "to_bucket": "<one of the 9 buckets>",
+          "kind": "aim_added" | "strategist_alert" | "rebalance" | "fyi",
+          "urgency": "low" | "normal" | "high",
+          "summary": "<one-line>",
+          "body": "<longer prose context>",
+          "expires_at": "<ISO-8601 UTC>" | None
+        }
+      ],
+      aim_status_changes=[
+        { "aim_id": "<existing Aim id>",
+          "status": "completed" | "dropped" | "active",
+          "reason": "" }
+      ]
+    )
 
 Rules:
 
-- Every list MUST be present, even if empty.
-- ``summary`` MUST be a non-empty markdown string. It is posted verbatim
-  to the strategist Discord thread.
-- Use empty lists if no Aims need to be created, no Signals need to be
-  sent, and no statuses need to flip. That is a valid, common run.
+- ``summary`` MUST be a non-empty markdown string. It is posted
+  verbatim to the strategist Discord thread.
+- Pass empty lists for sections you don't need — that is a valid,
+  common run. Do not omit the call.
 - Do not include any field not listed above; extras are rejected.
 - Do not queue worker jobs from here — that's the coaches' job. Send
   Signals so the coaches act on their next trigger.
@@ -345,6 +346,7 @@ def _build_prompt(state: StrategistState) -> dict[str, Any]:
     now_utc_s, now_local_s, tz_name = _format_time_block()
     reason = state.get("reason") or "scheduled-monitoring"
     snapshot = state.get("snapshot") or {}
+    token = state.get("result_token") or result_inbox.mint_token()
 
     system_text = (
         f"{base_prompt}\n\n"
@@ -357,15 +359,19 @@ def _build_prompt(state: StrategistState) -> dict[str, Any]:
         f"{_MONITORING_OUTPUT_INSTRUCTIONS}"
     )
     user_text = (
+        "## Run context\n"
+        f"- result_token: {token}  "
+        "(pass this to submit_strategist_result)\n\n"
         "Cross-bucket snapshot (JSON):\n\n"
         f"```json\n{_format_snapshot(snapshot)}\n```\n\n"
-        "Respond now with the single JSON code block."
+        "Decide what to do and call submit_strategist_result with the "
+        "result_token above."
     )
     messages: list[BaseMessage] = [
         SystemMessage(content=system_text),
         HumanMessage(content=user_text),
     ]
-    return {"messages": messages}
+    return {"messages": messages, "result_token": token}
 
 
 # ----------------------------------------------------------------- llm
@@ -376,36 +382,31 @@ def _call_llm(state: StrategistState) -> dict[str, Any]:
     if llm is None:
         llm = get_chat_model("strategist")
     messages = state.get("messages") or []
-    response = llm.invoke(messages)
-    content = response.content
-    if isinstance(content, list):
-        text_parts: list[str] = []
-        for item in cast(list[Any], content):
-            if isinstance(item, dict):
-                d = cast(dict[str, Any], item)
-                t = d.get("text")
-                if isinstance(t, str):
-                    text_parts.append(t)
-            elif isinstance(item, str):
-                text_parts.append(item)
-        text = "\n".join(text_parts)
-    else:
-        text = str(content)
-    return {"raw_response": text}
+    llm.invoke(messages)
+    # The LLM's text response is intentionally discarded — the
+    # structured result lands in the inbox via submit_strategist_result.
+    return {}
 
 
 # ----------------------------------------------------------------- parse
 
 
 def _parse_response(state: StrategistState) -> dict[str, Any]:
-    raw = state.get("raw_response", "")
-    block = extract_json_block(raw)
-    if block is None:
-        return {"error": "no JSON block found in strategist LLM response"}
+    token = state.get("result_token")
+    if not token:
+        return {"error": "strategist run had no result_token in state"}
+    payload = result_inbox.read_and_consume(token, agent_kind="strategist")
+    if payload is None:
+        return {
+            "error": (
+                "strategist did not call submit_strategist_result during its "
+                "turn — no structured result was deposited in the inbox"
+            )
+        }
     try:
-        parsed = StrategistOutput.model_validate_json(block)
+        parsed = StrategistOutput.model_validate(payload)
     except ValidationError as exc:
-        return {"error": f"invalid StrategistOutput JSON: {exc}"}
+        return {"error": f"invalid submit_strategist_result payload: {exc}"}
     return {"parsed": parsed}
 
 

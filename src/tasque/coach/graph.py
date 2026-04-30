@@ -26,14 +26,26 @@ from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 from pydantic import ValidationError
 
+from tasque.agents import result_inbox
 from tasque.buckets import Bucket
-from tasque.coach.output import BucketCoachOutput, extract_json_block
+from tasque.coach.output import BucketCoachOutput
 from tasque.coach.persist import persist_results
 from tasque.coach.prompts import build_system_prompt
 from tasque.config import get_settings
 from tasque.llm.factory import get_chat_model
 from tasque.memory.entities import Note, QueuedJob, Signal
 from tasque.memory.repo import query_bucket, query_signals_for
+
+# Tools the post-reply bucket-coach pass MUST NOT call: the synchronous
+# Discord reply path (``run_coach_reply``) already had a chance to execute
+# any user-initiated request. Without this gate, both sessions see the
+# user's "please run X" ephemeral note and both fire the chain — observed
+# duplicate-fire on 2026-04-27.
+_REPLY_TRIGGER_DISALLOWED_TOOLS: tuple[str, ...] = (
+    "mcp__tasque__chain_fire_template",
+    "mcp__tasque__chain_queue_adhoc",
+    "mcp__tasque__job_create",
+)
 
 if TYPE_CHECKING:
     from langgraph.graph.state import CompiledStateGraph
@@ -48,6 +60,7 @@ class BucketCoachState(TypedDict):
 
     bucket: Bucket
     reason: str
+    result_token: NotRequired[str]
     llm: NotRequired[BaseChatModel | None]
     notes: NotRequired[list[Note]]
     signals: NotRequired[list[Signal]]
@@ -184,30 +197,57 @@ def _build_prompt(state: BucketCoachState) -> dict[str, Any]:
     system_text = build_system_prompt(bucket)
     now_utc_s, now_local_s, tz_name = _format_time_block(reason)
     state_block = _format_state_block(state)
+    token = state.get("result_token") or result_inbox.mint_token()
+    is_post_reply = reason == "reply"
+    if is_post_reply:
+        action_guidance = (
+            "**Post-reply pass.** The user just received a synchronous reply "
+            "in this thread; that reply already executed any action the user "
+            "asked for. Your job here is consolidation only — note_create, "
+            "note_archive, signal_create, etc. The user-action tools "
+            "(``chain_fire_template``, ``chain_queue_adhoc``, ``job_create``) "
+            "are disabled for this pass; do not attempt them."
+        )
+    else:
+        action_guidance = (
+            "Perform any writes via the tasque MCP now (note_create, "
+            "job_create, chain_fire_template, signal_create, …)."
+        )
     user_text = (
         "## Run context\n"
         f"- Bucket: {bucket}\n"
         f"- Current time (UTC): {now_utc_s}\n"
         f"- Current time (local): {now_local_s} ({tz_name})\n"
-        f"- Trigger reason: {reason or '(no reason given)'}\n\n"
+        f"- Trigger reason: {reason or '(no reason given)'}\n"
+        f"- result_token: {token}  "
+        "(pass this to submit_coach_result)\n\n"
         f"{state_block}\n\n"
-        "Perform any writes via the tasque MCP now (note_create, job_create, "
-        "chain_fire_template, signal_create, …). When you're done, respond "
-        "with a single fenced JSON block — `{\"thread_post\": null}` for the "
-        "common 'no announcement' case, or `{\"thread_post\": \"<markdown>\"}` "
-        "to ask the bot to post to this bucket's thread."
+        f"{action_guidance} When you're done, call "
+        "``submit_coach_result(result_token=<above>, thread_post=...)`` "
+        "exactly once — pass ``thread_post=None`` for the common 'no "
+        "announcement' case, or a markdown string to ask the bot to post "
+        "to this bucket's thread."
     )
     messages: list[BaseMessage] = [
         SystemMessage(content=system_text),
         HumanMessage(content=user_text),
     ]
-    return {"messages": messages}
+    return {"messages": messages, "result_token": token}
 
 
 def _call_llm(state: BucketCoachState) -> dict[str, Any]:
     llm = state.get("llm")
     if llm is None:
-        llm = get_chat_model("coach")
+        reason = state.get("reason", "") or ""
+        # The Discord router enqueues the post-reply trigger with
+        # ``reason="reply"``. In that path the synchronous reply has
+        # already executed any user-initiated action, so we drop the
+        # corresponding action tools from the bucket-coach turn to
+        # prevent duplicate writes (chain double-fires, duplicate jobs).
+        disallowed: list[str] | None = (
+            list(_REPLY_TRIGGER_DISALLOWED_TOOLS) if reason == "reply" else None
+        )
+        llm = get_chat_model("coach", disallowed_tools=disallowed)
     messages = state.get("messages") or []
     response = llm.invoke(messages)
     content = response.content
@@ -228,16 +268,21 @@ def _call_llm(state: BucketCoachState) -> dict[str, Any]:
 
 
 def _parse_response(state: BucketCoachState) -> dict[str, Any]:
-    raw = state.get("raw_response", "")
-    block = extract_json_block(raw)
-    if block is None:
+    token = state.get("result_token")
+    if not token:
+        return {"error": "coach run had no result_token in state"}
+    payload = result_inbox.read_and_consume(token, agent_kind="coach")
+    if payload is None:
         return {
-            "error": "no JSON block found in LLM response",
+            "error": (
+                "coach did not call submit_coach_result during its turn — "
+                "no structured result was deposited in the inbox"
+            )
         }
     try:
-        parsed = BucketCoachOutput.model_validate_json(block)
+        parsed = BucketCoachOutput.model_validate(payload)
     except ValidationError as exc:
-        return {"error": f"invalid BucketCoachOutput JSON: {exc}"}
+        return {"error": f"invalid submit_coach_result payload: {exc}"}
     return {"parsed": parsed}
 
 

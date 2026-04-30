@@ -34,6 +34,7 @@ ALLOWED_NODE_KEYS: frozenset[str] = frozenset(
         "depends_on",
         "consumes",
         "fan_out_on",
+        "fan_out_concurrency",
         "status",
         "origin",
         "on_failure",
@@ -53,6 +54,16 @@ class PlanNode(TypedDict):
     """One step in a chain plan.
 
     All fields are present after ``validate_spec`` fills defaults.
+
+    ``fan_out_concurrency`` caps how many materialized children of a
+    fan-out template may be in ``running`` state at the same time.
+    ``None`` (the default) means unbounded — every materialized child
+    starts in parallel. Set to a positive integer to serialise (1) or
+    bound (>1) the fan-out, useful when the workers contend on a shared
+    external resource (e.g. a single browser profile, a rate-limited
+    API). Stored on the template; copied onto each child by
+    ``_materialize_fan_out`` so the supervisor can read it during
+    promotion without looking up the template separately.
     """
 
     id: str
@@ -61,6 +72,7 @@ class PlanNode(TypedDict):
     depends_on: list[str]
     consumes: list[str]
     fan_out_on: str | None
+    fan_out_concurrency: int | None
     status: PlanNodeStatus
     origin: PlanNodeOrigin
     on_failure: OnFailure
@@ -184,6 +196,34 @@ def _validate_one_node(raw: Mapping[str, Any], *, idx: int) -> PlanNode:
             f"got kind={kind!r}"
         )
 
+    fan_out_concurrency_raw = raw.get("fan_out_concurrency")
+    fan_out_concurrency: int | None
+    if fan_out_concurrency_raw is None:
+        fan_out_concurrency = None
+    else:
+        # Reject bool-as-int: ``True`` is an int subclass in Python and
+        # would silently pass through, but the field is a count not a
+        # flag.
+        if isinstance(fan_out_concurrency_raw, bool) or not isinstance(
+            fan_out_concurrency_raw, int
+        ):
+            raise SpecError(
+                f"plan[{idx}] (id={node_id!r}) 'fan_out_concurrency' must be a "
+                f"positive integer or null"
+            )
+        if fan_out_concurrency_raw < 1:
+            raise SpecError(
+                f"plan[{idx}] (id={node_id!r}) 'fan_out_concurrency' must be >= 1; "
+                f"got {fan_out_concurrency_raw}"
+            )
+        fan_out_concurrency = fan_out_concurrency_raw
+
+    if fan_out_concurrency is not None and fan_out_on is None:
+        raise SpecError(
+            f"plan[{idx}] (id={node_id!r}) 'fan_out_concurrency' is only valid "
+            f"on a fan-out template (set 'fan_out_on' too)"
+        )
+
     on_failure_raw = raw.get("on_failure", "halt")
     if on_failure_raw not in ("halt", "replan"):
         raise SpecError(
@@ -262,6 +302,7 @@ def _validate_one_node(raw: Mapping[str, Any], *, idx: int) -> PlanNode:
         depends_on=depends_on,
         consumes=consumes,
         fan_out_on=fan_out_on,
+        fan_out_concurrency=fan_out_concurrency,
         status=status,
         origin=origin,
         on_failure=on_failure,

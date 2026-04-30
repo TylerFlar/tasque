@@ -295,6 +295,152 @@ def test_launch_with_wait_false_returns_quickly(monkeypatch: pytest.MonkeyPatch)
         assert row["status"] == "completed"
 
 
+def test_resume_stale_chains_skips_fresh_checkpoints(
+    fake_worker_runner: dict[str, Any],
+) -> None:
+    """A chain whose checkpoint was just written must NOT be resumed.
+
+    Otherwise we'd race the in-flight runner thread and re-dispatch
+    work the original invoke is still doing — exactly what the
+    threshold filter is meant to prevent.
+    """
+    from tasque.chains import scheduler as sched
+
+    chain_id = launch_chain_run(_3_step_spec())  # reaches awaiting_approval
+    # Flip the row back to 'running' so the where clause picks it up.
+    with get_session() as sess:
+        sess.execute(
+            ChainRun.__table__.update()
+            .where(ChainRun.chain_id == chain_id)
+            .values(status="running")
+        )
+
+    # Fresh checkpoint (just written by launch_chain_run) → not stale.
+    resumed = sched.resume_stale_chains(threshold_seconds=30.0)
+    assert resumed == []
+
+
+def test_resume_stale_chains_picks_up_stale_running_row(
+    fake_worker_runner: dict[str, Any],
+) -> None:
+    """A chain whose checkpoint is older than the threshold appears in
+    the resumed list. Simulates an MCP-fired chain whose
+    ``claude --print`` subprocess died mid-invoke and left a stale
+    ``running`` row.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from tasque.chains import scheduler as sched
+
+    chain_id = launch_chain_run(_3_step_spec())
+    # Force back to 'running' so the where clause picks it up.
+    with get_session() as sess:
+        sess.execute(
+            ChainRun.__table__.update()
+            .where(ChainRun.chain_id == chain_id)
+            .values(status="running")
+        )
+    # threshold=0.0 + now=far_future ⇒ every row counts as stale.
+    future = datetime.now(UTC) + timedelta(hours=1)
+    resumed = sched.resume_stale_chains(threshold_seconds=0.0, now=future)
+    assert resumed == [chain_id]
+
+
+def test_resume_stale_chains_ignores_non_running_status(
+    fake_worker_runner: dict[str, Any],
+) -> None:
+    """Only ``running`` rows are candidates — completed / paused /
+    stopped chains are left alone."""
+    from datetime import UTC, datetime, timedelta
+
+    from tasque.chains import scheduler as sched
+
+    # Single-worker chain runs to completion; ChainRun.status flips to
+    # 'completed' via maybe_finalize_status. Non-running rows must be
+    # skipped by the WHERE clause regardless of checkpoint age.
+    spec: dict[str, Any] = {
+        "chain_name": "completed-demo",
+        "bucket": "personal",
+        "recurrence": None,
+        "planner_tier": "opus",
+        "plan": [
+            {"id": "only", "kind": "worker", "directive": "do thing", "tier": "haiku"},
+        ],
+    }
+    chain_id = launch_chain_run(spec)
+    future = datetime.now(UTC) + timedelta(hours=1)
+    resumed = sched.resume_stale_chains(threshold_seconds=0.0, now=future)
+    assert chain_id not in resumed
+
+
+def test_resume_stale_chains_skips_active_invoke_even_when_stale(
+    fake_worker_runner: dict[str, Any],
+) -> None:
+    """Even when the checkpoint looks stale by mtime, a chain whose
+    runner thread is currently alive in this process must not be
+    re-invoked — that would double-dispatch work the live invoke is
+    still doing (the original observed mid-LLM-turn race)."""
+    from datetime import UTC, datetime, timedelta
+
+    from tasque.chains import scheduler as sched
+
+    chain_id = launch_chain_run(_3_step_spec())
+    with get_session() as sess:
+        sess.execute(
+            ChainRun.__table__.update()
+            .where(ChainRun.chain_id == chain_id)
+            .values(status="running")
+        )
+
+    # Simulate an in-flight invoke for this chain. The registry is
+    # process-local, so we mark it active manually and verify the
+    # stale-resume path skips it despite a fully stale checkpoint.
+    sched._mark_invoke_active(chain_id)
+    try:
+        future = datetime.now(UTC) + timedelta(hours=1)
+        resumed = sched.resume_stale_chains(threshold_seconds=0.0, now=future)
+    finally:
+        sched._mark_invoke_inactive(chain_id)
+    assert chain_id not in resumed
+
+
+def test_active_invoke_registry_clears_after_launch_returns(
+    fake_worker_runner: dict[str, Any],
+) -> None:
+    """``launch_chain_run(wait=True)`` must remove its chain from the
+    active-invoke set on return so subsequent stale-resume passes can
+    legitimately recover it if needed (e.g. after a daemon restart with
+    a row left in 'running' from this very process — unusual, but the
+    invariant should hold)."""
+    from tasque.chains import scheduler as sched
+
+    chain_id = launch_chain_run(_3_step_spec())
+    assert not sched._is_invoke_active(chain_id)
+
+
+def test_checkpoint_age_seconds_returns_none_when_no_checkpoint() -> None:
+    from tasque.chains.scheduler import _checkpoint_age_seconds
+
+    assert _checkpoint_age_seconds("nonexistent-chain-id") is None
+
+
+def test_checkpoint_age_seconds_returns_seconds_when_checkpoint_exists(
+    fake_worker_runner: dict[str, Any],
+) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from tasque.chains.scheduler import _checkpoint_age_seconds
+
+    chain_id = launch_chain_run(_3_step_spec())
+    age = _checkpoint_age_seconds(chain_id)
+    assert age is not None and age >= 0.0
+
+    # Compute against a far-future reference: age should reflect that.
+    far = datetime.now(UTC) + timedelta(seconds=3600)
+    far_age = _checkpoint_age_seconds(chain_id, now=far)
+    assert far_age is not None and far_age >= 3600.0
+
+
 def test_launch_vars_default_to_empty_dict(monkeypatch: pytest.MonkeyPatch) -> None:
     """If neither the spec nor the launch call supplies vars, every
     worker sees an empty dict (never None or missing)."""

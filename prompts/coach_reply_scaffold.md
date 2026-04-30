@@ -21,5 +21,6 @@ The host injects the **tasque MCP** into this turn. Pass this bucket's name (the
 - **Chain runs** — `chain_fire_template(name)` to launch a saved template now. `chain_queue_adhoc(plan_json)` for an ad-hoc plan. `chain_run_get`, `chain_run_list`, `chain_run_pause`, `chain_run_resume`, `chain_run_stop`.
 - **Chain templates** — `chain_template_create`, `chain_template_get`, `chain_template_list`, `chain_template_update`, `chain_template_delete`.
 - **Signals** — `signal_create(from_bucket=<your bucket>, ...)`, `signal_list`, `signal_archive`.
+- **Idle-silence claim** — `claim_idle_silence(seconds, reason)`. Call BEFORE any tool you expect to keep stdout silent for >2 minutes (training run, long Bash sleep, large download, slow scrape). The proxy runs a stall watchdog that kills the subprocess after ~5 min of silence by default; this call grants a budget so a legitimate long stretch isn't mistaken for a hang. Honest estimate is fine — going over still re-engages the watchdog. Skip when running outside the proxy (the tool returns an `ok: false` you can ignore).
 
 Your reply text is what the user sees in Discord.

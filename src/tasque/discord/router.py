@@ -95,9 +95,7 @@ def _is_trivial(content: str) -> bool:
         return True
     if len(stripped) <= TRIVIAL_ACK_LIMIT:
         return True
-    if TRIVIAL_ACK_RE.match(stripped):
-        return True
-    return False
+    return bool(TRIVIAL_ACK_RE.match(stripped))
 
 
 def _resolve_registry_purpose(channel_id: int) -> str | None:

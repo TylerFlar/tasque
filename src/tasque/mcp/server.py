@@ -22,11 +22,13 @@ object(s) directly.
 from __future__ import annotations
 
 import json
+import os
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
 from sqlalchemy import or_, select, text
 
+from tasque.agents import result_inbox
 from tasque.buckets import ALL_BUCKETS
 from tasque.chains.crud import UNSET as _CRUD_UNSET
 from tasque.chains.crud import (
@@ -625,6 +627,271 @@ def build_server() -> FastMCP:
             sess.expunge_all()
         return json.dumps([_serialize_queued_job(j) for j in rows])
 
+    # ----------------------------------------------- agent result inbox
+
+    @mcp.tool()
+    def submit_worker_result(
+        result_token: str,
+        report: str,
+        summary: str,
+        produces: dict[str, Any] | None = None,
+        error: str | None = None,
+    ) -> str:
+        """Submit the structured result of THIS worker run.
+
+        Call this exactly once near the end of your turn, with the
+        ``result_token`` value from the run context section of your
+        prompt. The token is unique to this run; tasque reads the
+        payload back through it.
+
+        - ``report``: the full markdown body the user reads in the
+          thread. Long is fine; tasque chunks it.
+        - ``summary``: 1-2 sentences shown in the small embed
+          description. Do NOT duplicate the report here.
+        - ``produces``: structured data (scalars, short lists, ids,
+          status flags) downstream chain steps consume. Internal —
+          never rendered to the user. Default ``{}``.
+        - ``error``: short string identifying an application-level
+          failure that should mark THIS chain step as failed. Pass
+          this when your directive completed deterministically but
+          the underlying action did not succeed (e.g. browser
+          automation timed out, external API returned an error,
+          gates failed). Leave as ``None`` (the default) for normal
+          successful runs. The chain engine surfaces this on the
+          step's ``failure_reason`` field, flips the step to
+          ``failed``, and applies the step's ``on_failure`` policy
+          (halt / replan); if any step in the run ends up failed,
+          the overall ``ChainRun.status`` finalises as ``failed``
+          even when every worker turn returned cleanly.
+
+        Returns ``{"ok": true}`` on success or ``{"ok": false,
+        "error": "..."}`` on validation failure (token must be a
+        non-empty string, report/summary must be strings).
+        """
+        if not isinstance(result_token, str) or not result_token.strip():
+            return _err("result_token must be a non-empty string")
+        if not isinstance(report, str):
+            return _err("report must be a string")
+        if not isinstance(summary, str):
+            return _err("summary must be a string")
+        produces_dict: dict[str, Any] = produces or {}
+        if not isinstance(produces_dict, dict):
+            return _err("produces must be an object (or omitted)")
+        if error is not None and not isinstance(error, str):
+            return _err("error must be a string or omitted")
+        error_value = error.strip() if isinstance(error, str) else None
+        if error_value == "":
+            error_value = None
+        result_inbox.deposit(
+            result_token=result_token,
+            agent_kind="worker",
+            payload={
+                "report": report,
+                "summary": summary,
+                "produces": produces_dict,
+                "error": error_value,
+            },
+        )
+        return _ok()
+
+    @mcp.tool()
+    def submit_coach_result(
+        result_token: str,
+        thread_post: str | None = None,
+    ) -> str:
+        """Submit the structured result of THIS bucket-coach run.
+
+        Call this exactly once near the end of your turn, with the
+        ``result_token`` from the run context. Notes, jobs, signals,
+        and chain fires happen via their own MCP tools mid-turn — this
+        tool only carries the one declarative output: whether to post
+        a markdown message to the bucket's Discord thread.
+
+        - ``thread_post``: a non-empty markdown string when you want
+          tasque to post to the bucket's thread, or ``None`` (the
+          common case) for a quiet run.
+        """
+        if not isinstance(result_token, str) or not result_token.strip():
+            return _err("result_token must be a non-empty string")
+        if thread_post is not None and not isinstance(thread_post, str):
+            return _err("thread_post must be a string or null")
+        result_inbox.deposit(
+            result_token=result_token,
+            agent_kind="coach",
+            payload={"thread_post": thread_post},
+        )
+        return _ok()
+
+    @mcp.tool()
+    def claim_idle_silence(seconds: int, reason: str) -> str:
+        """Tell the tasque proxy you're about to be silent for ``seconds``.
+
+        Call this BEFORE you start any tool call you expect to take
+        more than ~2 minutes (model training, large download, long
+        sleep, slow scrape). The proxy spawned this run inside a
+        ``claude --print`` subprocess and runs a stall watchdog: if
+        stdout produces zero bytes for longer than its threshold AND
+        no idle-silence budget is in effect, it kills the subprocess
+        as hung. Without this call, a legitimate 30-min training job
+        looks identical to a hang and gets killed.
+
+        With this call, the watchdog grants the silence — no kill
+        until the budget expires, even with stdout completely silent.
+        If you're still mid-work when the budget runs out, call
+        ``claim_idle_silence`` again to extend.
+
+        - ``seconds``: how long you expect to be silent. Must be > 0.
+          Honest estimate is fine; over-budget always re-engages the
+          watchdog so a hung tool past your estimate still gets caught.
+        - ``reason``: short label ("training task1", "scraping
+          leaderboard", "sleeping for cron") — surfaced in
+          ``/status`` and in stall logs.
+
+        Returns ``{"ok": true, "granted_until_iso": "...", "remaining_s":
+        <float>}`` on success, or ``{"ok": false, "error": "..."}``
+        when not running under the proxy (no ``TASQUE_PROXY_REQUEST_ID``
+        in env — common for CLI-driven runs that don't go through the
+        proxy at all) or on a transport error.
+
+        Idempotent — extends rather than resets. Calling twice with
+        ``seconds=600`` doesn't grant 1200s; the larger of the two
+        ``now + seconds`` deadlines wins.
+        """
+        if not isinstance(seconds, int) or seconds <= 0:
+            return _err("seconds must be a positive integer")
+        if not isinstance(reason, str) or not reason.strip():
+            return _err("reason must be a non-empty string")
+        request_id = os.environ.get("TASQUE_PROXY_REQUEST_ID")
+        base_url = os.environ.get("TASQUE_PROXY_INTERNAL_URL")
+        if not request_id or not base_url:
+            return _err(
+                "no proxy context: TASQUE_PROXY_REQUEST_ID / "
+                "TASQUE_PROXY_INTERNAL_URL not set in env. This run "
+                "isn't going through tasque proxy, so there's no "
+                "watchdog to extend. (Skip the call.)"
+            )
+        # Lazy import: keep ``mcp serve`` startup cost low for the
+        # common case where this tool isn't called.
+        import urllib.error
+        import urllib.request
+
+        url = f"{base_url.rstrip('/')}/v1/internal/idle_grant/{request_id}"
+        body = json.dumps({"seconds": seconds, "reason": reason}).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers={"content-type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            try:
+                err_body = json.loads(exc.read().decode("utf-8"))
+            except Exception:
+                err_body = {"message": str(exc)}
+            return _err(
+                f"proxy returned HTTP {exc.code}: "
+                f"{(err_body.get('error') or {}).get('message', err_body)}"
+            )
+        except Exception as exc:
+            return _err(f"proxy unreachable: {type(exc).__name__}: {exc}")
+        return _ok(
+            granted_until_iso=payload.get("granted_until_iso"),
+            remaining_s=payload.get("remaining_s"),
+            reason=payload.get("reason"),
+        )
+
+    @mcp.tool()
+    def submit_planner_result(
+        result_token: str,
+        mutations: list[dict[str, Any]] | None = None,
+    ) -> str:
+        """Submit the structured result of THIS chain-planner run.
+
+        Call this exactly once with a list of plan mutations to apply
+        atomically. Each mutation is a dict with an ``op`` field; the
+        valid ops and their fields:
+
+        - ``{"op": "add_step", "node": {<plan node dict>}}`` — add a
+          new worker / approval node. ``origin`` is forced to
+          ``"planner"``.
+        - ``{"op": "remove_step", "id": "<step_id>"}``
+        - ``{"op": "reorder_deps", "id": "<step_id>", "depends_on":
+          [...]}``
+        - ``{"op": "abort_chain"}`` — halt the chain.
+
+        Empty list is the right answer when the failure is terminal
+        and nothing remediates it. Pass an empty list, not null.
+        """
+        if not isinstance(result_token, str) or not result_token.strip():
+            return _err("result_token must be a non-empty string")
+        muts = mutations if mutations is not None else []
+        if not isinstance(muts, list):
+            return _err("mutations must be a list (or omitted)")
+        result_inbox.deposit(
+            result_token=result_token,
+            agent_kind="planner",
+            payload={"mutations": muts},
+        )
+        return _ok()
+
+    @mcp.tool()
+    def submit_strategist_result(
+        result_token: str,
+        summary: str,
+        new_aims: list[dict[str, Any]] | None = None,
+        signals: list[dict[str, Any]] | None = None,
+        aim_status_changes: list[dict[str, Any]] | None = None,
+    ) -> str:
+        """Submit the structured result of THIS strategist monitoring run.
+
+        Call this exactly once with the markdown summary and any
+        Aims / Signals / status changes you want tasque to apply.
+
+        - ``summary``: non-empty markdown posted verbatim to the
+          strategist Discord thread.
+        - ``new_aims``: list of Aim dicts to create. Each item:
+          ``{"title", "scope": "long_term"|"bucket",
+            "bucket": str|null, "target_date": "YYYY-MM-DD"|null,
+            "description": str, "parent_id": str|null}``.
+        - ``signals``: list of Signal dicts. Each item:
+          ``{"to_bucket", "kind", "urgency", "summary", "body",
+            "expires_at": str|null}``.
+        - ``aim_status_changes``: list of status flips. Each item:
+          ``{"aim_id", "status": "active"|"completed"|"dropped",
+            "reason": str}``.
+
+        Pass empty lists (not null) for sections you don't need.
+        """
+        if not isinstance(result_token, str) or not result_token.strip():
+            return _err("result_token must be a non-empty string")
+        if not isinstance(summary, str) or not summary.strip():
+            return _err("summary must be a non-empty string")
+        new_aims_list = new_aims if new_aims is not None else []
+        signals_list = signals if signals is not None else []
+        status_changes_list = (
+            aim_status_changes if aim_status_changes is not None else []
+        )
+        if not isinstance(new_aims_list, list):
+            return _err("new_aims must be a list (or omitted)")
+        if not isinstance(signals_list, list):
+            return _err("signals must be a list (or omitted)")
+        if not isinstance(status_changes_list, list):
+            return _err("aim_status_changes must be a list (or omitted)")
+        result_inbox.deposit(
+            result_token=result_token,
+            agent_kind="strategist",
+            payload={
+                "summary": summary,
+                "new_aims": new_aims_list,
+                "signals": signals_list,
+                "aim_status_changes": status_changes_list,
+            },
+        )
+        return _ok()
+
     # --------------------------------------------------- chain templates
 
     @mcp.tool()
@@ -1130,6 +1397,11 @@ def build_server() -> FastMCP:
         note_create, note_get, note_list, note_search, note_search_any,
         note_search_fts, note_archive,
         job_create, job_get, job_update, job_cancel, job_list,
+        submit_worker_result,
+        submit_coach_result,
+        claim_idle_silence,
+        submit_planner_result,
+        submit_strategist_result,
         chain_template_create, chain_template_get, chain_template_list,
         chain_template_update, chain_template_delete,
         chain_fire_template, chain_queue_adhoc,

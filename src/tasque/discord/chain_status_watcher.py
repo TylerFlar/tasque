@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from typing import Any
 
 import structlog
@@ -40,6 +41,18 @@ log = structlog.get_logger(__name__)
 
 DEFAULT_POLL_SECONDS = 10.0
 MIN_POLL_SECONDS = 3.0  # Discord rate-limits message edits.
+
+# Discord refuses edits to messages older than 1 hour (error 30046).
+# Skip the edit attempt past this age and post a fresh message instead —
+# otherwise nextcord retries 5x on every tick before giving up.
+EDIT_MAX_MESSAGE_AGE_SECONDS = 55 * 60
+DISCORD_EPOCH_MS = 1_420_070_400_000
+
+
+def _snowflake_age_seconds(message_id: int, *, now_ms: int) -> float:
+    """Return the age in seconds of a Discord snowflake id."""
+    created_ms = (message_id >> 22) + DISCORD_EPOCH_MS
+    return max(0.0, (now_ms - created_ms) / 1000.0)
 
 # Statuses we re-render on. Terminal chains are also picked up for one
 # final edit (the watcher diffs signatures and quietly skips after the
@@ -130,6 +143,26 @@ def _persist_message_id(chain_run_pk: str, message_id: int) -> None:
         row.updated_at = utc_now_iso()
 
 
+def _clear_message_id(chain_run_pk: str) -> None:
+    """Drop the cached status message id once the chain has finished.
+
+    A terminal chain gets exactly one final edit (the embed flips to
+    completed/failed/stopped) and is then immutable — there's no further
+    state worth re-rendering. Clearing the id keeps the row from looking
+    "live", and the watcher's "skip terminal-with-no-status_message_id"
+    guard then short-circuits future ticks for this chain instead of
+    re-fetching its checkpoint state every poll forever.
+    """
+    with get_session() as sess:
+        row = sess.get(ChainRun, chain_run_pk)
+        if row is None:
+            return
+        if row.status_message_id is None:
+            return
+        row.status_message_id = None
+        row.updated_at = utc_now_iso()
+
+
 def _coerce_message_id(raw: str | None) -> int | None:
     if raw is None:
         return None
@@ -159,18 +192,40 @@ async def _post_or_edit(
     view = build_chain_control_view(chain_run.chain_id, run_status)
     cached = _coerce_message_id(chain_run.status_message_id)
     if cached is not None:
-        try:
-            await poster.edit_message(target, cached, embed=embed, view=view)
-            return cached
-        except Exception:
-            log.exception(
-                "discord.chain_status.edit_failed",
-                chain_id=chain_run.chain_id,
-                channel_id=target,
+        now_ms = int(time.time() * 1000)
+        age_s = _snowflake_age_seconds(cached, now_ms=now_ms)
+        if age_s >= EDIT_MAX_MESSAGE_AGE_SECONDS:
+            log.info(
+                "discord.chain_status.edit_skipped_age",
+                chain_id=chain_run.chain_id[:8],
                 message_id=cached,
+                age_s=round(age_s, 1),
             )
-            # Fall through to a fresh post — the user probably deleted
-            # the message.
+            if run_status in ("completed", "failed", "stopped"):
+                # Terminal chain whose cached panel fell out of editable
+                # age — typically observed on daemon restart after a
+                # long downtime. Re-posting a fresh terminal panel here
+                # would just flood the chains channel with duplicates of
+                # runs that are already finished. Clear the stale id and
+                # let the "skip-retroactive" guard short-circuit future
+                # ticks for this chain.
+                _clear_message_id(chain_run.id)
+                return None
+            # Active chains still need a live panel; fall through to a
+            # fresh post.
+        else:
+            try:
+                await poster.edit_message(target, cached, embed=embed, view=view)
+                return cached
+            except Exception:
+                log.exception(
+                    "discord.chain_status.edit_failed",
+                    chain_id=chain_run.chain_id,
+                    channel_id=target,
+                    message_id=cached,
+                )
+                # Fall through to a fresh post — the user probably deleted
+                # the message.
 
     try:
         new_id = await poster.post_embed(target, embed, view=view)
@@ -304,6 +359,12 @@ async def _tick(
                 # Mark notified regardless of post outcome so a transient
                 # Discord error doesn't cause us to spam-retry every tick.
                 notified_terminal.add(chain_run.chain_id)
+
+            # Drop the cached status_message_id now that the panel won't
+            # be edited again. Future ticks for this chain hit the
+            # "skip terminal-with-no-status_message_id" guard above and
+            # bail before doing any work.
+            _clear_message_id(chain_run.id)
 
     # Drop signatures for chains that are no longer in the watch set —
     # keeps the in-memory map from growing unboundedly across a long

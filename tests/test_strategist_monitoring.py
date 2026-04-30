@@ -30,7 +30,7 @@ from tasque.strategist.graph import (
 from tasque.strategist.output import StrategistOutput
 from tasque.strategist.persist import persist_results
 
-from .conftest import make_canned_chat_model
+from .conftest import make_strategist_result_chat_model
 
 
 @pytest.fixture(autouse=True)
@@ -215,7 +215,7 @@ def test_run_monitoring_persists_canned_llm_output() -> None:
         ],
         "aim_status_changes": [],
     }
-    fake_llm = make_canned_chat_model([canned])
+    fake_llm = make_strategist_result_chat_model([canned])
 
     state = run_monitoring(reason="test-trigger", llm=fake_llm)
 
@@ -240,11 +240,20 @@ def test_run_monitoring_persists_canned_llm_output() -> None:
         assert sigs[0].from_bucket == "strategist"
 
 
-def test_run_monitoring_records_error_on_unparseable_llm_output() -> None:
-    fake_llm = make_canned_chat_model(["this is not a JSON code block at all"])
-    state = run_monitoring(llm=fake_llm)
+def test_run_monitoring_records_error_when_tool_not_called() -> None:
+    """An LLM that finishes without calling submit_strategist_result
+    leaves the inbox empty — the graph must surface a clear error."""
+    from langchain_core.language_models.fake_chat_models import (
+        FakeMessagesListChatModel,
+    )
+    from langchain_core.messages import AIMessage
+
+    silent = FakeMessagesListChatModel(
+        responses=[AIMessage(content="prose only, no tool call")]
+    )
+    state = run_monitoring(llm=silent)
     assert "error" in state
-    assert "no JSON block" in state["error"]
+    assert "submit_strategist_result" in state["error"]
 
 
 def test_run_monitoring_records_error_on_invalid_schema() -> None:
@@ -254,10 +263,10 @@ def test_run_monitoring_records_error_on_invalid_schema() -> None:
         "signals": [],
         "aim_status_changes": [],
     }
-    fake_llm = make_canned_chat_model([bad])
+    fake_llm = make_strategist_result_chat_model([bad])
     state = run_monitoring(llm=fake_llm)
     assert "error" in state
-    assert "StrategistOutput" in state["error"]
+    assert "submit_strategist_result" in state["error"]
 
 
 # -------------------------------------------------- run_monitoring_and_post
@@ -275,7 +284,7 @@ async def test_monitoring_post_publishes_summary_to_strategist_thread() -> None:
         "signals": [],
         "aim_status_changes": [],
     }
-    fake_llm = make_canned_chat_model([canned])
+    fake_llm = make_strategist_result_chat_model([canned])
     state = await run_monitoring_and_post(llm=fake_llm)
     assert "error" not in state
 
@@ -299,7 +308,7 @@ async def test_monitoring_post_skips_when_no_strategist_thread() -> None:
         "signals": [],
         "aim_status_changes": [],
     }
-    fake_llm = make_canned_chat_model([canned])
+    fake_llm = make_strategist_result_chat_model([canned])
     state = await run_monitoring_and_post(llm=fake_llm)
     assert state.get("posted_message_ids") == []
     assert fake.sent_messages == []

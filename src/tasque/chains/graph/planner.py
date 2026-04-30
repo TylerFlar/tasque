@@ -28,9 +28,9 @@ from typing import Any, cast
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 
+from tasque.agents import result_inbox
 from tasque.chains.graph._common import ChainStateSchema, _now_iso
 from tasque.chains.spec import HistoryEntry, PlanNode, validate_spec
-from tasque.coach.output import extract_json_block
 from tasque.llm.factory import ALL_TIERS, Tier, get_chat_model_for_tier
 
 PLANNER_SYSTEM_PROMPT = """\
@@ -38,20 +38,20 @@ You are the tasque chain planner. A chain step has failed (or otherwise
 asked for replanning). Inspect the current plan, completed outputs, and
 failure reasons, and propose a small atomic patch.
 
-Respond with exactly one fenced JSON block of this shape:
+When you've decided on the mutations, call ``submit_planner_result``
+exactly once with the ``result_token`` from the user message:
 
-```json
-{
-  "mutations": [
-    { "op": "add_step", "node": { "id": "...", "kind": "worker",
-        "directive": "...", "depends_on": [...], "consumes": [...],
-        "tier": "haiku" | "sonnet" | "opus" } },
-    { "op": "remove_step", "id": "..." },
-    { "op": "reorder_deps", "id": "...", "depends_on": [...] },
-    { "op": "abort_chain" }
-  ]
-}
-```
+    submit_planner_result(
+      result_token="<value from run context>",
+      mutations=[
+        { "op": "add_step", "node": { "id": "...", "kind": "worker",
+            "directive": "...", "depends_on": [...], "consumes": [...],
+            "tier": "haiku" | "sonnet" | "opus" } },
+        { "op": "remove_step", "id": "..." },
+        { "op": "reorder_deps", "id": "...", "depends_on": [...] },
+        { "op": "abort_chain" }
+      ]
+    )
 
 Rules:
 - Only mutate; do not return a fully rewritten plan.
@@ -63,8 +63,8 @@ Rules:
   opus for agentic planning or deep generation.
 - ``remove_step`` is a no-op if the id isn't present.
 - ``abort_chain`` halts everything; use sparingly.
-- Empty mutations list is fine — return that if the failure is truly
-  terminal and nothing remediates it.
+- Empty mutations list is fine — pass ``mutations=[]`` if the failure
+  is truly terminal and nothing remediates it. Do not omit the call.
 """
 
 
@@ -78,21 +78,6 @@ def _format_completed(completed: dict[str, Any]) -> str:
 
 def _format_failures(failures: dict[str, str]) -> str:
     return json.dumps(failures, indent=2)
-
-
-def _extract_text(response_content: Any) -> str:
-    if isinstance(response_content, list):
-        text_parts: list[str] = []
-        for item in cast(list[Any], response_content):
-            if isinstance(item, dict):
-                d = cast(dict[str, Any], item)
-                t = d.get("text")
-                if isinstance(t, str):
-                    text_parts.append(t)
-            elif isinstance(item, str):
-                text_parts.append(item)
-        return "\n".join(text_parts)
-    return str(response_content)
 
 
 def _apply_mutations(
@@ -224,14 +209,19 @@ def planner(state: ChainStateSchema) -> dict[str, Any]:
             return {"replan": False, "history": err_history}
         llm = get_chat_model_for_tier(cast(Tier, planner_tier))
 
+    token = result_inbox.mint_token()
     user = (
+        "## Run context\n"
+        f"- result_token: {token}  "
+        "(pass this to submit_planner_result)\n\n"
         "Current plan:\n"
         f"{_format_plan(plan)}\n\n"
         "Completed outputs:\n"
         f"{_format_completed(completed)}\n\n"
         "Failures (step_id → reason):\n"
         f"{_format_failures(failures)}\n\n"
-        "Emit your mutations now."
+        "Decide on the mutations and call submit_planner_result with the "
+        "result_token above. Pass mutations=[] if nothing should change."
     )
     messages: list[BaseMessage] = [
         SystemMessage(content=PLANNER_SYSTEM_PROMPT),
@@ -240,7 +230,7 @@ def planner(state: ChainStateSchema) -> dict[str, Any]:
 
     history_appends: list[HistoryEntry] = []
     try:
-        response = llm.invoke(messages)
+        llm.invoke(messages)
     except Exception as exc:
         history_appends.append({
             "timestamp": _now_iso(),
@@ -249,26 +239,25 @@ def planner(state: ChainStateSchema) -> dict[str, Any]:
         })
         return {"replan": False, "history": history_appends}
 
-    text = _extract_text(response.content)
-    block = extract_json_block(text)
+    payload = result_inbox.read_and_consume(token, agent_kind="planner")
     mutations: list[dict[str, Any]] = []
-    if block is not None:
-        try:
-            payload = json.loads(block)
-            if isinstance(payload, dict):
-                raw_muts = payload.get("mutations")
-                if isinstance(raw_muts, list):
-                    mutations = [
-                        cast(dict[str, Any], m)
-                        for m in cast(list[Any], raw_muts)
-                        if isinstance(m, dict)
-                    ]
-        except json.JSONDecodeError as exc:
-            history_appends.append({
-                "timestamp": _now_iso(),
-                "kind": "mutation",
-                "details": {"op": "<parse-error>", "error": str(exc)},
-            })
+    if payload is None:
+        history_appends.append({
+            "timestamp": _now_iso(),
+            "kind": "mutation",
+            "details": {
+                "op": "<missing-result>",
+                "error": "planner did not call submit_planner_result",
+            },
+        })
+    else:
+        raw_muts = payload.get("mutations")
+        if isinstance(raw_muts, list):
+            mutations = [
+                cast(dict[str, Any], m)
+                for m in cast(list[Any], raw_muts)
+                if isinstance(m, dict)
+            ]
 
     new_plan, mut_history, _aborted = _apply_mutations(plan, mutations)
     history_appends.extend(mut_history)

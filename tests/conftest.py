@@ -8,11 +8,13 @@ pre-canned ``BucketCoachOutput`` JSON. Inject via the ``llm`` parameter on
 from __future__ import annotations
 
 import contextlib
+import re
 import sqlite3
 from collections.abc import Iterator
 from typing import Any
 
 import pytest
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -20,6 +22,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.pool import StaticPool
 
+from tasque.agents import result_inbox
 from tasque.chains import checkpointer as chain_checkpointer
 from tasque.chains import graph as chain_graph
 from tasque.coach import prompts as coach_prompts
@@ -83,3 +86,103 @@ def make_canned_chat_model(
 def fake_coach_llm() -> FakeMessagesListChatModel:
     """Default fake coach LLM — returns one all-empty BucketCoachOutput."""
     return make_canned_chat_model([{"thread_post": None}])
+
+
+_RESULT_TOKEN_RE = re.compile(r"result_token:\s*([0-9a-fA-F]+)")
+
+
+class _ResultDepositingLLM(BaseChatModel):
+    """Test stand-in that simulates an agent LLM's MCP tool call.
+
+    Production agents no longer parse the LLM's text output — they
+    read the structured result from ``agent_results`` after the LLM
+    calls ``submit_<agent>_result`` mid-turn. The langchain fake
+    chat model can't actually invoke MCP tools, so this stand-in
+    extracts the ``result_token`` from the prompt and writes the
+    canned payload directly to the inbox before returning.
+
+    ``agent_kind`` selects which agent's read will accept the row.
+    Pass either a single payload (used for every call) or a list of
+    payloads (consumed in order, looping after exhaustion).
+    """
+
+    agent_kind: str
+    payloads: list[dict[str, Any]]
+    cursor: int = 0
+
+    @property
+    def _llm_type(self) -> str:
+        return f"test-{self.agent_kind}-result-depositing"
+
+    def _generate(  # type: ignore[override]
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: Any | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        from langchain_core.outputs import ChatGeneration, ChatResult
+
+        prompt_text = "\n".join(
+            (m.content if isinstance(m.content, str) else str(m.content))
+            for m in messages
+        )
+        match = _RESULT_TOKEN_RE.search(prompt_text)
+        if match is not None:
+            token = match.group(1)
+            payload = self.payloads[self.cursor % len(self.payloads)]
+            self.cursor += 1
+            result_inbox.deposit(
+                result_token=token,
+                agent_kind=self.agent_kind,
+                payload=payload,
+            )
+        message = AIMessage(
+            content=f"ok — submit_{self.agent_kind}_result called"
+        )
+        return ChatResult(generations=[ChatGeneration(message=message)])
+
+
+def make_result_depositing_chat_model(
+    *,
+    agent_kind: str,
+    payloads: list[dict[str, Any]],
+) -> _ResultDepositingLLM:
+    """Build a fake chat model that simulates the inbox tool call for ``agent_kind``."""
+    return _ResultDepositingLLM(agent_kind=agent_kind, payloads=list(payloads))
+
+
+def make_worker_result_chat_model(
+    payloads: list[dict[str, Any]],
+) -> _ResultDepositingLLM:
+    """Convenience shim for ``agent_kind='worker'`` — used by worker tests."""
+    return make_result_depositing_chat_model(
+        agent_kind="worker", payloads=payloads
+    )
+
+
+def make_coach_result_chat_model(
+    payloads: list[dict[str, Any]],
+) -> _ResultDepositingLLM:
+    """Convenience shim for ``agent_kind='coach'``."""
+    return make_result_depositing_chat_model(
+        agent_kind="coach", payloads=payloads
+    )
+
+
+def make_planner_result_chat_model(
+    payloads: list[dict[str, Any]],
+) -> _ResultDepositingLLM:
+    """Convenience shim for ``agent_kind='planner'``."""
+    return make_result_depositing_chat_model(
+        agent_kind="planner", payloads=payloads
+    )
+
+
+def make_strategist_result_chat_model(
+    payloads: list[dict[str, Any]],
+) -> _ResultDepositingLLM:
+    """Convenience shim for ``agent_kind='strategist'``."""
+    return make_result_depositing_chat_model(
+        agent_kind="strategist", payloads=payloads
+    )

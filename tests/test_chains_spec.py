@@ -208,6 +208,100 @@ def test_worker_step_invalid_tier_rejected() -> None:
         validate_spec(spec)
 
 
+# ----------------------------------------------------- fan_out_concurrency
+
+def test_fan_out_concurrency_defaults_to_none_when_omitted() -> None:
+    spec = _base_spec(plan=[
+        {"id": "a", "kind": "worker", "directive": "x", "tier": "haiku"},
+        {
+            "id": "b",
+            "kind": "worker",
+            "directive": "y",
+            "depends_on": ["a"],
+            "consumes": ["a"],
+            "fan_out_on": "items",
+            "tier": "haiku",
+        },
+    ])
+    plan = validate_spec(spec)
+    fanout = next(n for n in plan if n["id"] == "b")
+    assert fanout["fan_out_concurrency"] is None
+
+
+def test_fan_out_concurrency_accepts_positive_int() -> None:
+    spec = _base_spec(plan=[
+        {"id": "a", "kind": "worker", "directive": "x", "tier": "haiku"},
+        {
+            "id": "b",
+            "kind": "worker",
+            "directive": "y",
+            "depends_on": ["a"],
+            "consumes": ["a"],
+            "fan_out_on": "items",
+            "fan_out_concurrency": 1,
+            "tier": "haiku",
+        },
+    ])
+    plan = validate_spec(spec)
+    fanout = next(n for n in plan if n["id"] == "b")
+    assert fanout["fan_out_concurrency"] == 1
+
+
+def test_fan_out_concurrency_zero_rejected() -> None:
+    spec = _base_spec(plan=[
+        {"id": "a", "kind": "worker", "directive": "x", "tier": "haiku"},
+        {
+            "id": "b",
+            "kind": "worker",
+            "directive": "y",
+            "depends_on": ["a"],
+            "consumes": ["a"],
+            "fan_out_on": "items",
+            "fan_out_concurrency": 0,
+            "tier": "haiku",
+        },
+    ])
+    with pytest.raises(SpecError, match="fan_out_concurrency"):
+        validate_spec(spec)
+
+
+def test_fan_out_concurrency_bool_rejected() -> None:
+    """``True`` is an int subclass; the validator must not silently accept
+    it as concurrency=1."""
+    spec = _base_spec(plan=[
+        {"id": "a", "kind": "worker", "directive": "x", "tier": "haiku"},
+        {
+            "id": "b",
+            "kind": "worker",
+            "directive": "y",
+            "depends_on": ["a"],
+            "consumes": ["a"],
+            "fan_out_on": "items",
+            "fan_out_concurrency": True,
+            "tier": "haiku",
+        },
+    ])
+    with pytest.raises(SpecError, match="fan_out_concurrency"):
+        validate_spec(spec)
+
+
+def test_fan_out_concurrency_without_fan_out_on_rejected() -> None:
+    spec = _base_spec(plan=[
+        {"id": "a", "kind": "worker", "directive": "x", "tier": "haiku"},
+        {
+            "id": "b",
+            "kind": "worker",
+            "directive": "y",
+            "depends_on": ["a"],
+            "consumes": ["a"],
+            "fan_out_concurrency": 1,
+            "tier": "haiku",
+        },
+    ])
+    with pytest.raises(SpecError, match="fan_out_concurrency"):
+        validate_spec(spec)
+
+
 def test_approval_step_with_tier_rejected() -> None:
     spec = _base_spec(plan=[
         {"id": "a", "kind": "worker", "directive": "x", "tier": "haiku"},

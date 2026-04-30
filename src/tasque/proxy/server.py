@@ -12,6 +12,7 @@ sees the MCP traffic — that is the whole point of this design.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -22,6 +23,8 @@ import threading
 import time
 import uuid
 from collections.abc import Iterable
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
@@ -41,9 +44,73 @@ LOG_RETENTION_SECONDS = 7 * 24 * 60 * 60
 # via stdin instead of `-p`.
 PROMPT_STDIN_THRESHOLD = 8 * 1024  # bytes
 
+# Stall watchdog: kill the ``claude --print`` subprocess if its stdout
+# produces zero bytes for this long AND no idle-silence budget is in
+# effect. Genuine hangs (model crashed mid-generate, deadlocked tool)
+# get caught; legitimately silent stretches are protected by the
+# subprocess calling ``mcp__tasque__claim_idle_silence`` first. Override
+# via ``TASQUE_PROXY_STALL_SECONDS``; ``0`` (or negative) disables the
+# kill entirely (the heartbeat log still fires).
+DEFAULT_STALL_SECONDS = 300.0  # 5 minutes
+DEFAULT_HEARTBEAT_SECONDS = 60.0  # idle-stretch log cadence
+_STALL_POLL_INTERVAL = 1.0
+
+
+def _resolve_stall_seconds() -> float:
+    raw = os.environ.get("TASQUE_PROXY_STALL_SECONDS")
+    if raw is None or raw.strip() == "":
+        return DEFAULT_STALL_SECONDS
+    try:
+        return float(raw)
+    except ValueError:
+        log.warning(
+            "proxy.stall_seconds_env_invalid",
+            value=raw,
+            falling_back_to=DEFAULT_STALL_SECONDS,
+        )
+        return DEFAULT_STALL_SECONDS
+
 
 class ProxyError(Exception):
     """Raised when claude --print returns no parsable result event."""
+
+
+class ProxyStallError(ProxyError):
+    """Subprocess was killed by the stall watchdog (silent past threshold
+    with no active idle-silence budget). Distinct from a wall-clock
+    timeout: only fires when the LLM is producing nothing AND hasn't
+    declared an upcoming silent stretch via ``claim_idle_silence``."""
+
+
+class ProxyCancelledError(ProxyError):
+    """Subprocess was killed via the explicit ``/v1/cancel/{id}`` endpoint."""
+
+
+@dataclass
+class _RequestRecord:
+    """Live state for one in-flight ``claude --print`` invocation.
+
+    Carried in :class:`_State.requests` while the request is running and
+    removed when ``_invoke_claude`` returns. Both the watchdog thread
+    and the HTTP handlers (``/v1/internal/idle_grant``, ``/v1/cancel``,
+    ``/status``) read/write this through ``_State.requests_lock``.
+    """
+
+    request_id: str
+    model: str
+    started_at: float  # monotonic
+    proc: subprocess.Popen[bytes]
+    last_byte_at: float  # monotonic
+    silence_budget_until: float | None = None  # monotonic, None if no budget
+    silence_budget_reason: str | None = None
+    silence_budget_seconds: float | None = None  # last grant size, for /status
+    cancel_requested: bool = False
+    stall_killed: bool = False
+    cancelled: bool = False
+    # Heartbeat tracking — the watchdog fires a log line every
+    # ``DEFAULT_HEARTBEAT_SECONDS`` of silence so the operator sees the
+    # subprocess go quiet before the watchdog kills.
+    last_heartbeat_at: float = field(default_factory=time.monotonic)
 
 
 class _State:
@@ -60,6 +127,16 @@ class _State:
         self._healthz_cached_at: float = 0.0
         self._healthz_cached_ok: bool = False
         self._healthz_lock = threading.Lock()
+        # Per-request registry. Keyed by request_id (uuid hex). The
+        # lock guards both dict access and per-record field reads/writes
+        # — records are dataclasses, not thread-safe on their own.
+        self.requests: dict[str, _RequestRecord] = {}
+        self.requests_lock = threading.Lock()
+        # Public URL for the proxy's own internal endpoints, injected
+        # into the ``claude --print`` subprocess env so the tasque MCP
+        # can call ``/v1/internal/idle_grant``. Set by ``make_server``
+        # once it knows the bound host:port.
+        self.internal_base_url: str | None = None
 
     def healthz(self) -> bool:
         """Return True if ``claude --version`` succeeded recently (cached 30s)."""
@@ -70,6 +147,18 @@ class _State:
             self._healthz_cached_ok = _claude_version_ok()
             self._healthz_cached_at = now
             return self._healthz_cached_ok
+
+    def register_request(self, record: _RequestRecord) -> None:
+        with self.requests_lock:
+            self.requests[record.request_id] = record
+
+    def unregister_request(self, request_id: str) -> None:
+        with self.requests_lock:
+            self.requests.pop(request_id, None)
+
+    def get_request(self, request_id: str) -> _RequestRecord | None:
+        with self.requests_lock:
+            return self.requests.get(request_id)
 
 
 def _claude_version_ok() -> bool:
@@ -114,6 +203,28 @@ def _flatten_messages(messages: list[dict[str, Any]]) -> str:
     return "\n\n".join(chunks)
 
 
+def _extract_disallowed_tools(body: dict[str, Any]) -> list[str] | None:
+    """Pull a per-request tool denylist out of an OpenAI-shaped body.
+
+    Vendor extension: callers may pass ``disallowed_tools: list[str]`` at
+    the top level of the request body, or nested under ``extra_body`` —
+    both produce the same effect (forwarded to ``claude --print`` as
+    ``--disallowedTools <comma-list>``). Used to gate user-action tools
+    in contexts where the synchronous reply path has already executed
+    the user's request (see the bucket-coach post-reply trigger).
+    Returns ``None`` when nothing usable was passed.
+    """
+    raw = body.get("disallowed_tools")
+    if raw is None:
+        extra = body.get("extra_body")
+        if isinstance(extra, dict):
+            raw = cast(dict[str, Any], extra).get("disallowed_tools")
+    if not isinstance(raw, list):
+        return None
+    cleaned = [str(t) for t in cast(list[Any], raw) if isinstance(t, str) and t.strip()]
+    return cleaned or None
+
+
 def _coerce_content(raw: Any) -> str:
     if isinstance(raw, str):
         return raw
@@ -137,6 +248,7 @@ def _build_claude_argv(
     model: str,
     prompt: str,
     use_stdin: bool,
+    disallowed_tools: list[str] | None = None,
 ) -> list[str]:
     argv = [
         exe,
@@ -154,9 +266,30 @@ def _build_claude_argv(
         "--permission-mode",
         "bypassPermissions",
     ]
+    if disallowed_tools:
+        argv.extend(["--disallowedTools", ",".join(disallowed_tools)])
     if not use_stdin:
         argv.extend(["-p", prompt])
     return argv
+
+
+def _claude_cwd() -> Path:
+    """Working directory for the ``claude --print`` subprocess.
+
+    Project-scoped MCP servers in ``~/.claude.json`` are keyed by the
+    invoking cwd. If the proxy's cwd doesn't match the tasque project
+    root, ``claude --print`` only sees user-scoped MCPs — the worker
+    LLM loses autopilot, slack, google-workspace, etc., and reports
+    "no autopilot tool available" mid-chain. Pinning the cwd here makes
+    the tool surface deterministic regardless of where ``tasque proxy``
+    was launched from. Override with ``TASQUE_CLAUDE_CWD`` for
+    non-standard layouts.
+    """
+    raw = os.environ.get("TASQUE_CLAUDE_CWD")
+    if raw:
+        return Path(raw)
+    # src/tasque/proxy/server.py → project root is parents[3]
+    return Path(__file__).resolve().parents[3]
 
 
 def _invoke_claude(
@@ -166,6 +299,9 @@ def _invoke_claude(
     request_id: str,
     log_dir: Path,
     timeout: float | None,
+    disallowed_tools: list[str] | None = None,
+    state: _State | None = None,
+    stall_seconds: float | None = None,
 ) -> tuple[str, dict[str, int]]:
     """Run ``claude --print`` and return (assembled_text, usage_dict).
 
@@ -175,25 +311,49 @@ def _invoke_claude(
     exits. The full raw stream is still buffered to a per-request
     JSONL file under ``log_dir`` for forensic replay.
 
-    Raises ``ProxyError`` on missing/garbled stream-json or on subprocess
-    failure that did not produce a ``result`` event.
+    ``state`` is the per-process registry — when supplied, this run is
+    registered so ``/v1/internal/idle_grant``, ``/v1/cancel``, and
+    ``/status`` can address it by ``request_id``. ``stall_seconds`` is
+    the silence-without-budget kill threshold (default
+    :data:`DEFAULT_STALL_SECONDS`); pass ``0`` or negative to disable
+    the kill (the heartbeat log still fires).
+
+    Raises :class:`ProxyStallError` on stall kill, :class:`ProxyCancelledError`
+    on explicit cancel, :class:`ProxyError` on timeout / missing /
+    garbled stream-json / subprocess failure with no ``result`` event.
     """
     exe = shutil.which("claude")
     if exe is None:
         raise ProxyError("claude CLI not found on PATH")
 
     use_stdin = len(prompt.encode("utf-8")) >= PROMPT_STDIN_THRESHOLD
-    argv = _build_claude_argv(exe=exe, model=model, prompt=prompt, use_stdin=use_stdin)
+    argv = _build_claude_argv(
+        exe=exe,
+        model=model,
+        prompt=prompt,
+        use_stdin=use_stdin,
+        disallowed_tools=disallowed_tools,
+    )
 
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{request_id}.jsonl"
     short_id = request_id[:8]
+
+    # Inject request id + internal URL so the tasque MCP can call
+    # ``/v1/internal/idle_grant/{request_id}`` to declare upcoming
+    # silent stretches without false-positive stall kills.
+    env = os.environ.copy()
+    env["TASQUE_PROXY_REQUEST_ID"] = request_id
+    if state is not None and state.internal_base_url:
+        env["TASQUE_PROXY_INTERNAL_URL"] = state.internal_base_url
 
     proc = subprocess.Popen(
         argv,
         stdin=subprocess.PIPE if use_stdin else subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        cwd=str(_claude_cwd()),
+        env=env,
     )
     if use_stdin:
         # stdin is closed before we start reading stdout to avoid the
@@ -213,6 +373,106 @@ def _invoke_claude(
     tool_calls = 0
     saw_first_text = False
     started = time.monotonic()
+    effective_stall = (
+        stall_seconds if stall_seconds is not None else _resolve_stall_seconds()
+    )
+
+    record = _RequestRecord(
+        request_id=request_id,
+        model=model,
+        started_at=started,
+        proc=proc,
+        last_byte_at=started,
+        last_heartbeat_at=started,
+    )
+    if state is not None:
+        state.register_request(record)
+
+    watchdog_done = threading.Event()
+
+    def _watchdog() -> None:
+        """Run while the subprocess is alive. Two responsibilities:
+
+        - **Heartbeat**: every ``DEFAULT_HEARTBEAT_SECONDS`` of stdout
+          silence, log a single ``proxy.idle_heartbeat`` line so the
+          operator sees the subprocess gone quiet before any kill.
+        - **Stall kill**: if silence exceeds ``effective_stall`` AND
+          there's no active ``silence_budget_until`` AND the kill is
+          enabled (``> 0``), kill the subprocess. The for-loop above
+          then exits on EOF; the post-loop check converts that to a
+          :class:`ProxyStallError`.
+
+        Cancellation requests from ``/v1/cancel/{request_id}`` are also
+        observed here — same kill path, different error class.
+        """
+        while not watchdog_done.is_set():
+            if proc.poll() is not None:
+                return
+            now = time.monotonic()
+            should_kill_stall = False
+            should_kill_cancel = False
+            if state is not None:
+                with state.requests_lock:
+                    rec = state.requests.get(request_id)
+                    if rec is None:
+                        return
+                    if rec.cancel_requested and not rec.cancelled:
+                        should_kill_cancel = True
+                        rec.cancelled = True
+                    elif effective_stall > 0:
+                        idle = now - rec.last_byte_at
+                        budget_until = rec.silence_budget_until
+                        in_budget = budget_until is not None and now < budget_until
+                        if idle > effective_stall and not in_budget:
+                            should_kill_stall = True
+                            rec.stall_killed = True
+                        elif (
+                            now - rec.last_heartbeat_at >= DEFAULT_HEARTBEAT_SECONDS
+                            and idle >= DEFAULT_HEARTBEAT_SECONDS
+                        ):
+                            rec.last_heartbeat_at = now
+                            log.info(
+                                "proxy.idle_heartbeat",
+                                request_id=short_id,
+                                model=model,
+                                idle_s=round(idle, 1),
+                                budget_remaining_s=(
+                                    round(budget_until - now, 1)
+                                    if budget_until is not None and budget_until > now
+                                    else None
+                                ),
+                                budget_reason=rec.silence_budget_reason,
+                            )
+            if should_kill_cancel:
+                log.warning(
+                    "proxy.cancel_kill",
+                    request_id=short_id,
+                    model=model,
+                )
+                with contextlib.suppress(Exception):
+                    proc.kill()
+                return
+            if should_kill_stall:
+                log.warning(
+                    "proxy.stall_kill",
+                    request_id=short_id,
+                    model=model,
+                    threshold_s=round(effective_stall, 1),
+                )
+                with contextlib.suppress(Exception):
+                    proc.kill()
+                return
+            if watchdog_done.wait(timeout=_STALL_POLL_INTERVAL):
+                return
+
+    watchdog: threading.Thread | None = None
+    if state is not None:
+        watchdog = threading.Thread(
+            target=_watchdog,
+            name=f"proxy-watchdog-{short_id}",
+            daemon=True,
+        )
+        watchdog.start()
 
     assert proc.stdout is not None
     try:
@@ -221,6 +481,13 @@ def _invoke_claude(
                 proc.kill()
                 proc.communicate()
                 raise ProxyError(f"claude --print timed out after {timeout}s")
+            now = time.monotonic()
+            if state is not None:
+                with state.requests_lock:
+                    rec = state.requests.get(request_id)
+                    if rec is not None:
+                        rec.last_byte_at = now
+                        rec.last_heartbeat_at = now
             line_text = line_bytes.decode("utf-8", errors="replace")
             raw_lines.append(line_text)
             stripped = line_text.strip()
@@ -240,6 +507,7 @@ def _invoke_claude(
             )
             tool_calls += new_tool_calls
     finally:
+        watchdog_done.set()
         # Drain stderr now that stdout is done. ``communicate`` returns
         # the leftover bytes; we don't need stdout because we already
         # streamed it.
@@ -248,6 +516,23 @@ def _invoke_claude(
         except subprocess.TimeoutExpired:
             proc.kill()
             _, stderr_bytes = proc.communicate()
+        if state is not None:
+            state.unregister_request(request_id)
+        if watchdog is not None:
+            watchdog.join(timeout=2)
+
+    # Watchdog may have killed the subprocess; raise the corresponding
+    # error so callers can distinguish stall / cancel from other modes.
+    if record.cancelled:
+        raise ProxyCancelledError(
+            f"claude --print cancelled via /v1/cancel (request_id={short_id})"
+        )
+    if record.stall_killed:
+        raise ProxyStallError(
+            f"claude --print killed by stall watchdog after "
+            f"{round(effective_stall, 1)}s of stdout silence "
+            f"with no idle-silence budget (request_id={short_id})"
+        )
 
     stdout_text = "".join(raw_lines)
     stderr_text = stderr_bytes.decode("utf-8", errors="replace")
@@ -267,7 +552,7 @@ def _invoke_claude(
         stdout_text, exit_code=proc.returncode, stderr=stderr_text
     )
     log.info(
-        "proxy.response_sent",
+        "proxy.upstream_finished",
         request_id=short_id,
         model=model,
         duration_s=round(time.monotonic() - started, 2),
@@ -437,6 +722,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if self.path == "/v1/chat/completions":
             self._handle_chat_completions()
             return
+        if self.path.startswith("/v1/internal/idle_grant/"):
+            request_id = self.path[len("/v1/internal/idle_grant/"):]
+            self._handle_idle_grant(request_id)
+            return
+        if self.path.startswith("/v1/cancel/"):
+            request_id = self.path[len("/v1/cancel/"):]
+            self._handle_cancel(request_id)
+            return
         self._send_json(HTTPStatus.NOT_FOUND, {"error": {"message": "not found"}})
 
     # ------------------------------------------------------------------ handlers
@@ -454,6 +747,26 @@ class ProxyHandler(BaseHTTPRequestHandler):
         with self.state.in_flight_lock:
             in_flight = self.state.in_flight
             total = self.state.total_requests
+        now_mono = time.monotonic()
+        with self.state.requests_lock:
+            request_view = [
+                {
+                    "request_id": r.request_id,
+                    "model": r.model,
+                    "elapsed_s": round(now_mono - r.started_at, 1),
+                    "last_byte_age_s": round(now_mono - r.last_byte_at, 1),
+                    "silence_budget_remaining_s": (
+                        round(r.silence_budget_until - now_mono, 1)
+                        if r.silence_budget_until is not None
+                        and r.silence_budget_until > now_mono
+                        else None
+                    ),
+                    "silence_budget_seconds": r.silence_budget_seconds,
+                    "silence_budget_reason": r.silence_budget_reason,
+                    "cancel_requested": r.cancel_requested,
+                }
+                for r in self.state.requests.values()
+            ]
         self._send_json(
             HTTPStatus.OK,
             {
@@ -461,7 +774,108 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 "capacity": self.state.max_concurrent,
                 "total_requests": total,
                 "last_error": self.state.last_error,
+                "requests": request_view,
             },
+        )
+
+    def _handle_idle_grant(self, request_id: str) -> None:
+        """Tasque-MCP-only endpoint: extend the silence budget for a
+        running ``claude --print`` request.
+
+        Body: ``{"seconds": <number>, "reason": "<short label>"}``. The
+        budget is calculated from *now* — calling twice with the same
+        ``seconds`` does not double it; the larger of (``now + seconds``,
+        existing ``silence_budget_until``) wins. Returns 404 when the
+        request_id is unknown (typical: subprocess already exited or the
+        MCP guessed the wrong id), 400 on a malformed body.
+        """
+        try:
+            body = self._read_json_body()
+        except ValueError as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": {"message": str(exc)}})
+            return
+        seconds_raw = body.get("seconds")
+        try:
+            seconds = float(seconds_raw)
+        except (TypeError, ValueError):
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": {"message": "seconds must be a positive number"}},
+            )
+            return
+        if seconds <= 0:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": {"message": "seconds must be > 0"}},
+            )
+            return
+        reason_raw = body.get("reason")
+        reason = (
+            str(reason_raw).strip()
+            if isinstance(reason_raw, str) and reason_raw.strip()
+            else None
+        )
+        now_mono = time.monotonic()
+        new_until = now_mono + seconds
+        with self.state.requests_lock:
+            rec = self.state.requests.get(request_id)
+            if rec is None:
+                self._send_json(
+                    HTTPStatus.NOT_FOUND,
+                    {"error": {"message": f"unknown request_id {request_id!r}"}},
+                )
+                return
+            existing = rec.silence_budget_until
+            chosen_until = (
+                max(existing, new_until) if existing is not None else new_until
+            )
+            rec.silence_budget_until = chosen_until
+            rec.silence_budget_seconds = seconds
+            rec.silence_budget_reason = reason
+            granted_remaining = chosen_until - now_mono
+        granted_until_iso = (
+            datetime.now(UTC) + timedelta(seconds=granted_remaining)
+        ).isoformat()
+        log.info(
+            "proxy.idle_grant",
+            request_id=request_id[:8],
+            seconds=round(seconds, 1),
+            remaining_s=round(granted_remaining, 1),
+            reason=reason,
+        )
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "ok": True,
+                "request_id": request_id,
+                "granted_until_iso": granted_until_iso,
+                "remaining_s": round(granted_remaining, 1),
+                "reason": reason,
+            },
+        )
+
+    def _handle_cancel(self, request_id: str) -> None:
+        """Operator-facing endpoint: kill a running ``claude --print``.
+
+        Returns 404 when ``request_id`` is unknown (already finished or
+        never started), 200 with ``{"ok": true}`` otherwise. The actual
+        kill happens asynchronously in the watchdog within ~1s of this
+        request returning; the corresponding ``/v1/chat/completions``
+        call will then surface a :class:`ProxyCancelledError` as a 502.
+        """
+        with self.state.requests_lock:
+            rec = self.state.requests.get(request_id)
+            if rec is None:
+                self._send_json(
+                    HTTPStatus.NOT_FOUND,
+                    {"error": {"message": f"unknown request_id {request_id!r}"}},
+                )
+                return
+            rec.cancel_requested = True
+        log.info("proxy.cancel_requested", request_id=request_id[:8])
+        self._send_json(
+            HTTPStatus.OK,
+            {"ok": True, "request_id": request_id},
         )
 
     def _handle_chat_completions(self) -> None:
@@ -491,6 +905,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if isinstance(item, dict):
                 messages_typed.append(cast(dict[str, Any], item))
         prompt = _flatten_messages(messages_typed)
+        disallowed_tools = _extract_disallowed_tools(body)
         request_id = uuid.uuid4().hex
         log.info(
             "proxy.request_received",
@@ -498,6 +913,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             model=model,
             messages=len(messages_typed),
             prompt_kb=round(len(prompt.encode("utf-8")) / 1024, 1),
+            disallowed_tools=len(disallowed_tools) if disallowed_tools else 0,
         )
 
         with self.state.semaphore:
@@ -511,6 +927,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     request_id=request_id,
                     log_dir=self.state.log_dir,
                     timeout=self.request_timeout,
+                    disallowed_tools=disallowed_tools,
+                    state=self.state,
                 )
             except ProxyError as exc:
                 self.state.last_error = str(exc)
@@ -545,6 +963,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 text=text,
                 usage=usage,
             ),
+        )
+        log.info(
+            "proxy.response_sent",
+            request_id=request_id[:8],
+            model=model,
+            chars=len(text),
+            in_tokens=usage.get("input_tokens", 0),
+            out_tokens=usage.get("output_tokens", 0),
         )
 
     # ----------------------------------------------------------------- helpers
@@ -641,6 +1067,13 @@ def make_server(
         {"state": state, "request_timeout": resolved_timeout},
     )
     server = ThreadingHTTPServer((host, port), cast(Any, handler_cls))
+    # Pin the public-facing URL the tasque MCP uses to call the proxy's
+    # internal endpoints (``/v1/internal/idle_grant/<request_id>``).
+    # ``host=0.0.0.0`` would bind all interfaces but the MCP runs on
+    # the same machine, so 127.0.0.1 is the right address to publish.
+    bound_host, bound_port = server.server_address[0], server.server_address[1]
+    advertised_host = "127.0.0.1" if bound_host in ("0.0.0.0", "::") else bound_host
+    state.internal_base_url = f"http://{advertised_host}:{bound_port}"
     return server, state
 
 
@@ -699,6 +1132,7 @@ def serve(
         max_concurrent=state.max_concurrent,
         log_dir=str(state.log_dir),
         timeout=timeout,
+        claude_cwd=str(_claude_cwd()),
     )
     try:
         if iterations is None:

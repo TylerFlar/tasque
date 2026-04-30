@@ -54,8 +54,22 @@ class _FakePoster:
     def __init__(self) -> None:
         self.embeds_posted: list[tuple[int, dict[str, Any], Any]] = []
         self.edits: list[tuple[int, int, dict[str, Any] | None, Any]] = []
-        self.next_message_id = 9000
+        # Generate ids that look like fresh Discord snowflakes — the
+        # watcher derives message age from the snowflake bits and would
+        # otherwise classify a tiny integer like 9000 as ~11 years old
+        # and refuse to edit it. ``next_message_id`` here is just a
+        # disambiguating tail so consecutive posts don't collide.
+        self.next_message_id = 0
         self.edit_should_raise = False
+
+    def _fresh_snowflake(self) -> int:
+        import time
+
+        from tasque.discord.chain_status_watcher import DISCORD_EPOCH_MS
+
+        self.next_message_id += 1
+        ms = int(time.time() * 1000) - DISCORD_EPOCH_MS
+        return (ms << 22) | self.next_message_id
 
     async def send_message(self, channel_id: int, content: str) -> int:
         return 0
@@ -63,9 +77,9 @@ class _FakePoster:
     async def send_embed(
         self, channel_id: int, embed: dict[str, Any], view: Any | None = None
     ) -> int:
-        self.next_message_id += 1
+        msg_id = self._fresh_snowflake()
         self.embeds_posted.append((channel_id, embed, view))
-        return self.next_message_id
+        return msg_id
 
     async def edit_message(
         self,
@@ -499,6 +513,61 @@ async def test_watcher_re_posts_after_edit_failure(
         assert row["status_message_id"] != "424242"
 
 
+@pytest.mark.asyncio
+async def test_watcher_skips_terminal_chain_with_stale_message_id() -> None:
+    """Daemon restart after long downtime: a terminal chain's cached
+    message id is now too old to edit. The watcher must NOT post a
+    fresh duplicate panel — that flooded the chains channel on every
+    restart. It should clear the stale id and let the skip-retroactive
+    guard handle the chain on subsequent ticks.
+    """
+    fake = _FakePoster()
+    poster.set_client(fake)  # type: ignore[arg-type]
+
+    from tasque.memory.entities import ChainRun as ChainRunEntity
+    from tasque.memory.entities import utc_now_iso
+
+    chain_id = "stalecid000000000"
+    # Snowflake from 2 hours ago — well past the 55min edit window.
+    import time as _time
+    two_hours_ago_ms = int(_time.time() * 1000) - 2 * 60 * 60 * 1000
+    stale_id = (
+        (two_hours_ago_ms - chain_status_watcher.DISCORD_EPOCH_MS) << 22
+    ) | 1
+    with get_session() as sess:
+        sess.add(
+            ChainRunEntity(
+                id="row" + chain_id[:8],
+                chain_id=chain_id,
+                chain_name="stale-demo",
+                bucket="personal",
+                status="completed",
+                started_at=utc_now_iso(),
+                ended_at=utc_now_iso(),
+                status_message_id=str(stale_id),
+            )
+        )
+
+    await chain_status_watcher.run_chain_status_watcher(
+        max_iterations=1, poll_seconds=0
+    )
+
+    # No fresh post for the terminal chain whose panel fell out of
+    # editable age — that's exactly the flood we're preventing.
+    assert fake.embeds_posted == []
+    assert fake.edits == []
+    # The stale id should have been cleared so the skip-retroactive
+    # guard picks up subsequent ticks before doing any work.
+    with get_session() as sess:
+        row = sess.execute(
+            ChainRunEntity.__table__.select().where(
+                ChainRunEntity.chain_id == chain_id
+            )
+        ).mappings().first()
+        assert row is not None
+        assert row["status_message_id"] is None
+
+
 # ------------------------------- terminal one-shot notification
 
 
@@ -669,3 +738,18 @@ async def test_watcher_terminal_notify_fires_on_running_to_completed() -> None:
         "persistent terminal_notified_at must survive a fresh watcher "
         "process so the user does not get a duplicate report on restart"
     )
+
+    # status_message_id must be cleared after the terminal embed lands —
+    # there's no panel to keep editing once the chain is finished, and
+    # holding the id forever is just stale state on the row.
+    with get_session() as sess:
+        row = sess.execute(
+            ChainRunEntity.__table__.select().where(
+                ChainRunEntity.chain_id == chain_id
+            )
+        ).mappings().first()
+        assert row is not None
+        assert row["status_message_id"] is None, (
+            "status_message_id should be cleared once the chain reaches "
+            "terminal — the panel is no longer being edited"
+        )

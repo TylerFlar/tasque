@@ -20,6 +20,7 @@ The host injects the **tasque MCP** into this turn. Every write you make — not
 - **Chain templates** — `chain_template_create`, `chain_template_get`, `chain_template_list`, `chain_template_update`, `chain_template_delete`.
 - **Signals** — `signal_create(from_bucket=<your bucket>, to_bucket=<other>, ...)` to nudge another coach about something in your bucket. `signal_list`, `signal_archive`.
 - **Aims (rare for bucket coaches)** — `aim_get`, `aim_list`. Strategist owns Aim creation/updates.
+- **Idle-silence claim** — `claim_idle_silence(seconds, reason)`. Call BEFORE any tool you expect to keep stdout silent for >2 minutes. The proxy stall watchdog kills the subprocess after ~5 min of silence by default; this call grants a budget so a legitimate long stretch isn't killed as a hang. Going over your estimate still re-engages the watchdog, so over-budget hangs still get caught.
 
 Tier guidance for `job_create` and chain plans: **haiku** for trivial nudges, short prompts, static emits; **sonnet** for multi-step tool / scrape / summarize work and conditional branching; **opus** for agentic planning, code iteration, or deep creative generation.
 

@@ -50,6 +50,18 @@ def _has_fan_out_children(plan: list[PlanNode], step_id: str) -> bool:
     return bool(_children_of(plan, step_id))
 
 
+def _template_id_of(node_id: str) -> str | None:
+    """Return the template id for a fan-out child, or None for a non-child.
+
+    Fan-out children have ids of the form ``{template}[{i}]``; the
+    template id is everything before the first ``[``.
+    """
+    bracket = node_id.find("[")
+    if bracket == -1:
+        return None
+    return node_id[:bracket]
+
+
 def _all_dep_ids_satisfied(plan: list[PlanNode], node: PlanNode) -> bool:
     """Stricter than ``_deps_satisfied`` from _common: a dep that is a
     fan-out template must have all materialized children completed too."""
@@ -159,6 +171,10 @@ def _materialize_fan_out(
             "depends_on": list(template["depends_on"]),
             "consumes": list(template["consumes"]),
             "fan_out_on": None,
+            # Children inherit the template's concurrency cap so the
+            # supervisor's promotion step can read it from any sibling
+            # without having to look up the (already-completed) template.
+            "fan_out_concurrency": template.get("fan_out_concurrency"),
             "status": "pending",
             "origin": template["origin"],
             "on_failure": template["on_failure"],
@@ -255,6 +271,16 @@ def supervisor(state: ChainStateSchema) -> dict[str, Any]:
     plan.extend(new_children)
 
     # 3. Promote pending → running for steps whose deps are satisfied.
+    # Track running siblings per fan-out template so we can enforce
+    # ``fan_out_concurrency``: a child whose template is capped at K
+    # must defer if K of its siblings are already running.
+    running_per_template: dict[str, int] = {}
+    for n in plan:
+        if n["status"] == "running":
+            tid = _template_id_of(n["id"])
+            if tid is not None:
+                running_per_template[tid] = running_per_template.get(tid, 0) + 1
+
     for n in plan:
         if n["status"] != "pending":
             continue
@@ -264,6 +290,17 @@ def supervisor(state: ChainStateSchema) -> dict[str, Any]:
             continue
         if not _all_dep_ids_satisfied(plan, n):
             continue
+        cap = n.get("fan_out_concurrency")
+        if isinstance(cap, int) and cap > 0:
+            tid = _template_id_of(n["id"])
+            if tid is not None:
+                current = running_per_template.get(tid, 0)
+                if current >= cap:
+                    # At cap; leave this child pending. The next
+                    # supervisor pass (after a sibling completes) will
+                    # promote it.
+                    continue
+                running_per_template[tid] = current + 1
         n["status"] = "running"
         history_appends.append({
             "timestamp": _now_iso(),
@@ -371,5 +408,6 @@ __all__ = [
     "_gather_consumes_payload",
     "_materialize_fan_out",
     "_route_from_supervisor",
+    "_template_id_of",
     "supervisor",
 ]

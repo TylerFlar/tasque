@@ -433,6 +433,24 @@ def _sweep_nondurable_memory_safe() -> None:
         )
 
 
+def _reap_agent_results_safe() -> None:
+    """Wrapper for the agent-result inbox reaper that swallows exceptions.
+
+    The inbox is short-lived per-run state — agents delete their own
+    rows on read. This sweep catches leftovers from a process crash
+    between minting a token and reading it back.
+    """
+    from tasque.agents import result_inbox
+
+    try:
+        swept = result_inbox.reap_stale()
+    except Exception:
+        log.exception("jobs.scheduler.agent_results_reap_failed")
+        return
+    if swept:
+        log.info("jobs.scheduler.agent_results_reaped", rows=swept)
+
+
 def start_scheduler(*, tick_seconds: int = DEFAULT_TICK_SECONDS) -> BackgroundScheduler:
     """Start a BackgroundScheduler ticking every ``tick_seconds``.
 
@@ -478,6 +496,20 @@ def start_scheduler(*, tick_seconds: int = DEFAULT_TICK_SECONDS) -> BackgroundSc
         # after startup so a long-stopped daemon catches up immediately.
         next_run_time=datetime.now(UTC) + timedelta(seconds=max(tick_seconds * 2, 30)),
         id="tasque-memory-decay",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+    # Agent-result inbox reaper. Rows are normally consumed within the
+    # same agent run that wrote them; this catches leftovers from a
+    # process crash between minting a token and reading it back. Hourly
+    # is well below the default ``DEFAULT_REAP_AGE_SECONDS`` (3600s).
+    scheduler.add_job(
+        _reap_agent_results_safe,
+        trigger="interval",
+        hours=1,
+        next_run_time=datetime.now(UTC) + timedelta(seconds=max(tick_seconds * 2, 30)),
+        id="tasque-agent-results-reap",
         max_instances=1,
         coalesce=True,
         replace_existing=True,

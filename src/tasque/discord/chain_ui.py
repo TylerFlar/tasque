@@ -26,6 +26,7 @@ Pause / Resume / Stop buttons attached to the live status panel.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, cast
 
 import structlog
@@ -276,7 +277,6 @@ def build_chain_control_view(chain_id: str, run_status: str) -> Any:
 # ----------------------------------------------------------------- watcher
 
 
-from collections.abc import Callable
 
 
 def _chains_channel_id() -> int | None:

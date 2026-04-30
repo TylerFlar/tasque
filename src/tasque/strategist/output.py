@@ -1,13 +1,12 @@
 """Pydantic schema for the strategist's structured monitoring output.
 
 The monitoring graph (``strategist.graph.run_monitoring``) calls the
-LLM with the cross-bucket snapshot and expects a single fenced JSON
-block matching :class:`StrategistOutput`. The decomposition path does
-*not* go through this schema — that one runs through the parameterised
-reply runtime and writes Aims/Signals via tools.
-
-Reuse ``tasque.coach.output.extract_json_block`` for fence stripping;
-the format is identical (`````json ... `````).
+LLM with the cross-bucket snapshot and expects the model to call
+``submit_strategist_result`` with a payload matching
+:class:`StrategistOutput`. The graph reads that payload back through
+the agent result inbox. The decomposition path does *not* go through
+this schema — that one runs through the parameterised reply runtime
+and writes Aims/Signals via tools.
 """
 
 from __future__ import annotations

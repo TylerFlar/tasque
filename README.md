@@ -42,6 +42,9 @@ ids).
 #   - the coach trigger drainer
 #   - the chain status watcher (live-edits per-run status embeds)
 #   - the worker run watcher (posts worker output to the jobs channel)
+#   - the chain resume ticker (boot resume of interrupted chains, then
+#     periodic stale-chain resume to pick up MCP-fired chains whose
+#     runner thread died with a finished claude --print subprocess)
 # The bot's on_ready also installs the ops-panel watcher (the live
 # /status embed in the ops channel).
 uv run tasque serve
@@ -137,13 +140,26 @@ Knobs:
 - `TASQUE_PROXY_TIMEOUT` — optional float seconds applied to
   `subprocess.communicate(timeout=…)`. Unset means no timeout; trust outer
   guards (the daemon sets per-step timeouts).
+- `TASQUE_PROXY_STALL_SECONDS` (default 300) — stdout-silence threshold
+  for the stall watchdog. If a `claude --print` subprocess produces zero
+  bytes for this long AND no idle-silence budget is in effect, the proxy
+  kills it as hung. Set to `0` to disable the kill (the heartbeat log
+  still fires every 60s of silence). Agents declare upcoming silent
+  stretches via the `claim_idle_silence` MCP tool — see the tasque MCP
+  section below.
 - `TASQUE_PROXY_LOG_DIR` (default `data/proxy-logs`) — per-request raw
   stream-json transcripts, named `<request_id>.jsonl`. Files older than
   7 days are pruned at startup.
+- `TASQUE_CLAUDE_CWD` — override the cwd used to spawn `claude --print`.
+  Defaults to the tasque project root so project-scoped MCP servers in
+  `~/.claude.json` resolve correctly regardless of where `tasque proxy`
+  was launched from.
 
 Endpoints: `POST /v1/chat/completions`, `GET /healthz` (200 when
 `claude --version` succeeds, 503 otherwise; cached 30 s),
-`GET /status` (in-flight count, capacity, totals, last error).
+`GET /status` (in-flight count, capacity, totals, last error, and a
+per-request view with elapsed / idle / silence-budget state),
+`POST /v1/cancel/<request_id>` (kill an in-flight subprocess by id).
 
 ## tasque MCP
 
@@ -187,6 +203,25 @@ will list them):
   `chain_run_get`, `chain_run_list`, `chain_run_pause`,
   `chain_run_resume`, `chain_run_stop`.
 - **Signals** — `signal_create`, `signal_list`, `signal_archive`.
+- **Aims** — `aim_create`, `aim_get`, `aim_update`, `aim_list`
+  (strategist owns Aim writes; bucket coaches typically only read).
+- **Agent result submission** — `submit_worker_result`,
+  `submit_coach_result`, `submit_planner_result`,
+  `submit_strategist_result`. Each agent (worker / bucket coach /
+  chain planner / strategist monitoring) ends its turn by calling its
+  matching tool with a `result_token` from the run context. The tool
+  drops the structured payload into a transient SQLite inbox; the
+  Python-side runner reads-and-deletes by token. This replaces
+  post-hoc JSON parsing of the model's text response — if the agent
+  forgets to call its tool, the run is recorded as a failure. Idle
+  rows are reaped hourly.
+- **Idle-silence claim** — `claim_idle_silence(seconds, reason)`.
+  Tells the proxy stall watchdog you're about to be silent for
+  `seconds` (training run, large download, slow scrape). Honest
+  estimate; over-budget re-engages the watchdog so genuine hangs
+  past the estimate still get caught. No-op (returns
+  `{"ok": false}`) when the call isn't running through `tasque
+  proxy`.
 
 Bucket scoping is by explicit argument: every write that touches a
 bucket takes a `bucket` parameter, validated against the nine canonical
@@ -206,7 +241,7 @@ With the MCP registered:
 
 ```bash
 # In Claude Code or any MCP-aware host, you should see "tasque" listed
-# alongside your other MCPs and 26 tools available. From inside a model
+# alongside your other MCPs and ~38 tools available. From inside a model
 # turn:
 #   chain_template_list()                          → JSON array of templates
 #   note_create(content="hello", bucket="personal") → {"ok": true, "id": "..."}
@@ -357,6 +392,13 @@ uv run tasque chain delete <template-name>
 Mirror columns on `ChainTemplate` (`recurrence`, `bucket`) must match the
 values inside `plan_json`. Every write goes through `validate_spec`,
 which rejects mismatches at the seam.
+
+Fan-out templates default to launching all materialized children in
+parallel. Cap the in-flight count by setting `fan_out_concurrency` on
+the template node — useful when the children contend on a shared
+resource (single browser profile, rate-limited API). The supervisor
+defers promotion of pending siblings until the count drops below the
+cap.
 
 ## Discord
 

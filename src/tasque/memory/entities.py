@@ -244,6 +244,31 @@ class CoachPending(Base):
     claimed_at: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
 
+class AgentResult(Base):
+    """Transient inbox for an agent's structured LLM output.
+
+    Each ``run_*`` call (worker, coach, planner, strategist) mints a
+    fresh ``result_token`` and embeds it in the LLM prompt. The LLM is
+    instructed to call the agent's ``submit_<kind>_result`` MCP tool,
+    which writes a row here keyed by that token. The agent then reads
+    and deletes the row to obtain its structured result — no post-hoc
+    JSON parsing of the LLM's text output is involved.
+
+    Rows are short-lived: the agent deletes its own row on read. Any
+    leftover rows (process crash mid-run, LLM never called the tool)
+    are swept by an idle reaper based on ``created_at`` age.
+    """
+
+    __tablename__ = "agent_results"
+
+    result_token: Mapped[str] = mapped_column(String(64), primary_key=True)
+    agent_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[str] = mapped_column(
+        String(32), default=utc_now_iso, nullable=False
+    )
+
+
 class Attachment(Base):
     __tablename__ = "attachments"
 
