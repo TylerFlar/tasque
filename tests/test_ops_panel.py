@@ -156,8 +156,8 @@ def test_snapshot_counts_templates() -> None:
 
     plan = _json.dumps({
         "chain_name": "t1", "bucket": None, "recurrence": None,
-        "planner_tier": "opus",
-        "plan": [{"id": "a", "kind": "worker", "directive": "x", "tier": "haiku"}],
+        "planner_tier": "large",
+        "plan": [{"id": "a", "kind": "worker", "directive": "x", "tier": "small"}],
     })
     write_entity(ChainTemplate(
         chain_name="t1", bucket=None, recurrence=None,
@@ -321,8 +321,8 @@ def test_next_upcoming_includes_chain_template_fires() -> None:
     plan = _json.dumps({
         "chain_name": "frequent-chain", "bucket": "personal",
         "recurrence": "*/1 * * * *",
-        "planner_tier": "opus",
-        "plan": [{"id": "a", "kind": "worker", "directive": "x", "tier": "haiku"}],
+        "planner_tier": "large",
+        "plan": [{"id": "a", "kind": "worker", "directive": "x", "tier": "small"}],
     })
     write_entity(ChainTemplate(
         chain_name="frequent-chain", bucket="personal",

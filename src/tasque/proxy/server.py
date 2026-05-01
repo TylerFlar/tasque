@@ -1,18 +1,17 @@
-"""OpenAI-compat HTTP wrapper around ``claude --print``.
+"""OpenAI-compat HTTP wrapper around a local model CLI.
 
 The proxy is a subprocess shim. It receives an OpenAI-shaped chat-completions
-request, flattens the messages into a single prompt, invokes the host's
-``claude --print`` CLI in stream-json mode, parses the resulting JSONL stream
-for the final ``result`` event, and returns an OpenAI-shaped response.
+request, flattens the messages into a single prompt, invokes the selected
+upstream CLI (Claude or Codex), parses its JSONL stream, and returns an
+OpenAI-shaped response.
 
-The LLM-side tool calls happen entirely inside ``claude --print`` against
-whatever MCPs the user has configured in ``~/.claude.json``. The proxy never
-sees the MCP traffic — that is the whole point of this design.
+The LLM-side tool calls happen entirely inside the upstream CLI against
+whatever MCPs the user has configured for that host. The proxy never sees the
+MCP traffic — that is the whole point of this design.
 """
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 import shutil
@@ -24,15 +23,16 @@ import time
 import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
-from typing import Any, ClassVar, cast
+from typing import Any, ClassVar, Literal, cast
 
 import structlog
 
 log = structlog.get_logger(__name__)
+
+Upstream = Literal["claude", "codex"]
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 3456
@@ -44,80 +44,47 @@ LOG_RETENTION_SECONDS = 7 * 24 * 60 * 60
 # via stdin instead of `-p`.
 PROMPT_STDIN_THRESHOLD = 8 * 1024  # bytes
 
-# Stall watchdog: kill the ``claude --print`` subprocess if its stdout
-# produces zero bytes for this long AND no idle-silence budget is in
-# effect. Genuine hangs (model crashed mid-generate, deadlocked tool)
-# get caught; legitimately silent stretches are protected by the
-# subprocess calling ``mcp__tasque__claim_idle_silence`` first. Override
-# via ``TASQUE_PROXY_STALL_SECONDS``; ``0`` (or negative) disables the
-# kill entirely (the heartbeat log still fires).
-DEFAULT_STALL_SECONDS = 300.0  # 5 minutes
-DEFAULT_HEARTBEAT_SECONDS = 60.0  # idle-stretch log cadence
-_STALL_POLL_INTERVAL = 1.0
-
-
-def _resolve_stall_seconds() -> float:
-    raw = os.environ.get("TASQUE_PROXY_STALL_SECONDS")
-    if raw is None or raw.strip() == "":
-        return DEFAULT_STALL_SECONDS
-    try:
-        return float(raw)
-    except ValueError:
-        log.warning(
-            "proxy.stall_seconds_env_invalid",
-            value=raw,
-            falling_back_to=DEFAULT_STALL_SECONDS,
-        )
-        return DEFAULT_STALL_SECONDS
+# Idle monitor: log long quiet stretches so operators can tell a request is
+# still in-flight. It never kills or times out the upstream CLI.
+IDLE_HEARTBEAT_SECONDS = 60.0
+_IDLE_MONITOR_POLL_SECONDS = 1.0
 
 
 class ProxyError(Exception):
-    """Raised when claude --print returns no parsable result event."""
-
-
-class ProxyStallError(ProxyError):
-    """Subprocess was killed by the stall watchdog (silent past threshold
-    with no active idle-silence budget). Distinct from a wall-clock
-    timeout: only fires when the LLM is producing nothing AND hasn't
-    declared an upcoming silent stretch via ``claim_idle_silence``."""
-
-
-class ProxyCancelledError(ProxyError):
-    """Subprocess was killed via the explicit ``/v1/cancel/{id}`` endpoint."""
+    """Raised when the upstream CLI returns no parsable result event."""
 
 
 @dataclass
 class _RequestRecord:
-    """Live state for one in-flight ``claude --print`` invocation.
+    """Live state for one in-flight upstream CLI invocation.
 
     Carried in :class:`_State.requests` while the request is running and
-    removed when ``_invoke_claude`` returns. Both the watchdog thread
-    and the HTTP handlers (``/v1/internal/idle_grant``, ``/v1/cancel``,
-    ``/status``) read/write this through ``_State.requests_lock``.
+    removed when ``_invoke_upstream`` returns. Both the idle monitor thread
+    and the HTTP handlers read/write this through ``_State.requests_lock``.
     """
 
     request_id: str
     model: str
+    upstream: Upstream
     started_at: float  # monotonic
     proc: subprocess.Popen[bytes]
     last_byte_at: float  # monotonic
-    silence_budget_until: float | None = None  # monotonic, None if no budget
-    silence_budget_reason: str | None = None
-    silence_budget_seconds: float | None = None  # last grant size, for /status
-    cancel_requested: bool = False
-    stall_killed: bool = False
-    cancelled: bool = False
-    # Heartbeat tracking — the watchdog fires a log line every
-    # ``DEFAULT_HEARTBEAT_SECONDS`` of silence so the operator sees the
-    # subprocess go quiet before the watchdog kills.
+    # Heartbeat tracking: the idle monitor emits an observability-only log line
+    # every ``IDLE_HEARTBEAT_SECONDS`` of stdout silence.
     last_heartbeat_at: float = field(default_factory=time.monotonic)
 
 
 class _State:
     """Process-global counters and bookkeeping shared across handler threads."""
 
-    def __init__(self, max_concurrent: int, log_dir: Path) -> None:
+    def __init__(
+        self,
+        max_concurrent: int,
+        log_dir: Path,
+        upstream: Upstream,
+    ) -> None:
         self.max_concurrent = max_concurrent
+        self.upstream: Upstream = upstream
         self.semaphore = threading.Semaphore(max_concurrent)
         self.in_flight = 0
         self.in_flight_lock = threading.Lock()
@@ -132,19 +99,14 @@ class _State:
         # — records are dataclasses, not thread-safe on their own.
         self.requests: dict[str, _RequestRecord] = {}
         self.requests_lock = threading.Lock()
-        # Public URL for the proxy's own internal endpoints, injected
-        # into the ``claude --print`` subprocess env so the tasque MCP
-        # can call ``/v1/internal/idle_grant``. Set by ``make_server``
-        # once it knows the bound host:port.
-        self.internal_base_url: str | None = None
 
     def healthz(self) -> bool:
-        """Return True if ``claude --version`` succeeded recently (cached 30s)."""
+        """Return True if the selected upstream CLI responds (cached 30s)."""
         with self._healthz_lock:
             now = time.monotonic()
             if now - self._healthz_cached_at < HEALTHZ_CACHE_SECONDS:
                 return self._healthz_cached_ok
-            self._healthz_cached_ok = _claude_version_ok()
+            self._healthz_cached_ok = _upstream_version_ok(self.upstream)
             self._healthz_cached_at = now
             return self._healthz_cached_ok
 
@@ -161,8 +123,28 @@ class _State:
             return self.requests.get(request_id)
 
 
-def _claude_version_ok() -> bool:
-    exe = shutil.which("claude")
+def _env_upstream() -> Upstream:
+    raw = os.environ.get("TASQUE_PROXY_UPSTREAM")
+    if raw is None or not raw.strip():
+        raise ProxyError("TASQUE_PROXY_UPSTREAM is required: set it to 'claude' or 'codex'")
+    normalized = raw.strip().lower()
+    if normalized in ("claude", "codex"):
+        return normalized
+    raise ProxyError(
+        f"TASQUE_PROXY_UPSTREAM must be 'claude' or 'codex', got {raw!r}"
+    )
+
+
+def _upstream_executable(upstream: Upstream) -> str:
+    return "codex" if upstream == "codex" else "claude"
+
+
+def _upstream_display(upstream: Upstream) -> str:
+    return "codex exec" if upstream == "codex" else "claude --print"
+
+
+def _upstream_version_ok(upstream: Upstream) -> bool:
+    exe = shutil.which(_upstream_executable(upstream))
     if exe is None:
         return False
     try:
@@ -178,7 +160,7 @@ def _claude_version_ok() -> bool:
 
 
 def _flatten_messages(messages: list[dict[str, Any]]) -> str:
-    """Collapse OpenAI-style messages into a single text prompt for claude --print.
+    """Collapse OpenAI-style messages into a single text prompt.
 
     System messages are concatenated at the top. User/assistant turns follow,
     each prefixed with their role label. ``content`` may be a plain string or
@@ -208,10 +190,12 @@ def _extract_disallowed_tools(body: dict[str, Any]) -> list[str] | None:
 
     Vendor extension: callers may pass ``disallowed_tools: list[str]`` at
     the top level of the request body, or nested under ``extra_body`` —
-    both produce the same effect (forwarded to ``claude --print`` as
-    ``--disallowedTools <comma-list>``). Used to gate user-action tools
-    in contexts where the synchronous reply path has already executed
-    the user's request (see the bucket-coach post-reply trigger).
+    both produce the same effect. Claude receives
+    ``--disallowedTools <comma-list>``; upstreams without a native deny
+    flag receive an instruction in-prompt. Used to gate user-action
+    tools in contexts where the synchronous reply path has already
+    executed the user's request (see the bucket-coach post-reply
+    trigger).
     Returns ``None`` when nothing usable was passed.
     """
     raw = body.get("disallowed_tools")
@@ -273,8 +257,44 @@ def _build_claude_argv(
     return argv
 
 
-def _claude_cwd() -> Path:
-    """Working directory for the ``claude --print`` subprocess.
+def _build_codex_argv(
+    *,
+    exe: str,
+    model: str,
+    cwd: Path,
+) -> list[str]:
+    return [
+        exe,
+        "exec",
+        "--json",
+        "--ephemeral",
+        "--skip-git-repo-check",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--model",
+        model,
+        "--cd",
+        str(cwd),
+        "-",
+    ]
+
+
+def _prepend_disallowed_tool_instruction(prompt: str, disallowed_tools: list[str]) -> str:
+    denylist = "\n".join(f"- {name}" for name in disallowed_tools)
+    return (
+        "System safety constraint for this turn: do not call any MCP/tool with "
+        "one of these exact names if it is available.\n"
+        f"{denylist}\n\n"
+        f"{prompt}"
+    )
+
+
+def _project_root() -> Path:
+    # src/tasque/proxy/server.py -> project root is parents[3]
+    return Path(__file__).resolve().parents[3]
+
+
+def _upstream_cwd(upstream: Upstream) -> Path:
+    """Working directory for the upstream CLI subprocess.
 
     Project-scoped MCP servers in ``~/.claude.json`` are keyed by the
     invoking cwd. If the proxy's cwd doesn't match the tasque project
@@ -282,28 +302,33 @@ def _claude_cwd() -> Path:
     LLM loses autopilot, slack, google-workspace, etc., and reports
     "no autopilot tool available" mid-chain. Pinning the cwd here makes
     the tool surface deterministic regardless of where ``tasque proxy``
-    was launched from. Override with ``TASQUE_CLAUDE_CWD`` for
-    non-standard layouts.
+    was launched from. Codex also receives the cwd as ``--cd`` so it
+    starts in the same trusted project. Override with
+    ``TASQUE_CLAUDE_CWD`` / ``TASQUE_CODEX_CWD`` or the generic
+    ``TASQUE_PROXY_CWD`` for non-standard layouts.
     """
-    raw = os.environ.get("TASQUE_CLAUDE_CWD")
+    provider_env = (
+        os.environ.get("TASQUE_CODEX_CWD")
+        if upstream == "codex"
+        else os.environ.get("TASQUE_CLAUDE_CWD")
+    )
+    raw = provider_env or os.environ.get("TASQUE_PROXY_CWD")
     if raw:
         return Path(raw)
-    # src/tasque/proxy/server.py → project root is parents[3]
-    return Path(__file__).resolve().parents[3]
+    return _project_root()
 
 
-def _invoke_claude(
+def _invoke_upstream(
     *,
+    upstream: Upstream,
     model: str,
     prompt: str,
     request_id: str,
     log_dir: Path,
-    timeout: float | None,
     disallowed_tools: list[str] | None = None,
     state: _State | None = None,
-    stall_seconds: float | None = None,
 ) -> tuple[str, dict[str, int]]:
-    """Run ``claude --print`` and return (assembled_text, usage_dict).
+    """Run the selected upstream CLI and return (assembled_text, usage_dict).
 
     Streams stdout line-by-line so the operator can see tool calls,
     text starts, and message boundaries land in the proxy console as
@@ -311,49 +336,48 @@ def _invoke_claude(
     exits. The full raw stream is still buffered to a per-request
     JSONL file under ``log_dir`` for forensic replay.
 
-    ``state`` is the per-process registry — when supplied, this run is
-    registered so ``/v1/internal/idle_grant``, ``/v1/cancel``, and
-    ``/status`` can address it by ``request_id``. ``stall_seconds`` is
-    the silence-without-budget kill threshold (default
-    :data:`DEFAULT_STALL_SECONDS`); pass ``0`` or negative to disable
-    the kill (the heartbeat log still fires).
+    ``state`` is the per-process registry. When supplied, this run appears in
+    ``/status`` until the upstream process exits.
 
-    Raises :class:`ProxyStallError` on stall kill, :class:`ProxyCancelledError`
-    on explicit cancel, :class:`ProxyError` on timeout / missing /
-    garbled stream-json / subprocess failure with no ``result`` event.
+    Raises :class:`ProxyError` on missing / garbled stream-json or subprocess
+    failure with no ``result`` event.
     """
-    exe = shutil.which("claude")
+    exe_name = _upstream_executable(upstream)
+    upstream_label = _upstream_display(upstream)
+    exe = shutil.which(exe_name)
     if exe is None:
-        raise ProxyError("claude CLI not found on PATH")
-
-    use_stdin = len(prompt.encode("utf-8")) >= PROMPT_STDIN_THRESHOLD
-    argv = _build_claude_argv(
-        exe=exe,
-        model=model,
-        prompt=prompt,
-        use_stdin=use_stdin,
-        disallowed_tools=disallowed_tools,
-    )
+        raise ProxyError(f"{exe_name} CLI not found on PATH")
 
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{request_id}.jsonl"
     short_id = request_id[:8]
 
-    # Inject request id + internal URL so the tasque MCP can call
-    # ``/v1/internal/idle_grant/{request_id}`` to declare upcoming
-    # silent stretches without false-positive stall kills.
-    env = os.environ.copy()
-    env["TASQUE_PROXY_REQUEST_ID"] = request_id
-    if state is not None and state.internal_base_url:
-        env["TASQUE_PROXY_INTERNAL_URL"] = state.internal_base_url
+    upstream_cwd = _upstream_cwd(upstream)
+    if upstream == "codex":
+        use_stdin = True
+        if disallowed_tools:
+            prompt = _prepend_disallowed_tool_instruction(prompt, disallowed_tools)
+        argv = _build_codex_argv(
+            exe=exe,
+            model=model,
+            cwd=upstream_cwd,
+        )
+    else:
+        use_stdin = len(prompt.encode("utf-8")) >= PROMPT_STDIN_THRESHOLD
+        argv = _build_claude_argv(
+            exe=exe,
+            model=model,
+            prompt=prompt,
+            use_stdin=use_stdin,
+            disallowed_tools=disallowed_tools,
+        )
 
     proc = subprocess.Popen(
         argv,
         stdin=subprocess.PIPE if use_stdin else subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        cwd=str(_claude_cwd()),
-        env=env,
+        cwd=str(upstream_cwd),
     )
     if use_stdin:
         # stdin is closed before we start reading stdout to avoid the
@@ -364,22 +388,19 @@ def _invoke_claude(
             proc.stdin.write(prompt.encode("utf-8"))
             proc.stdin.close()
         except (OSError, BrokenPipeError) as exc:
-            proc.kill()
-            proc.communicate()
+            proc.wait()
             raise ProxyError(f"failed to feed prompt over stdin: {exc}") from exc
 
-    deadline = time.monotonic() + timeout if timeout is not None else None
     raw_lines: list[str] = []
+    stderr_chunks: list[bytes] = []
     tool_calls = 0
     saw_first_text = False
     started = time.monotonic()
-    effective_stall = (
-        stall_seconds if stall_seconds is not None else _resolve_stall_seconds()
-    )
 
     record = _RequestRecord(
         request_id=request_id,
         model=model,
+        upstream=upstream,
         started_at=started,
         proc=proc,
         last_byte_at=started,
@@ -388,99 +409,63 @@ def _invoke_claude(
     if state is not None:
         state.register_request(record)
 
-    watchdog_done = threading.Event()
+    monitor_done = threading.Event()
 
-    def _watchdog() -> None:
-        """Run while the subprocess is alive. Two responsibilities:
-
-        - **Heartbeat**: every ``DEFAULT_HEARTBEAT_SECONDS`` of stdout
-          silence, log a single ``proxy.idle_heartbeat`` line so the
-          operator sees the subprocess gone quiet before any kill.
-        - **Stall kill**: if silence exceeds ``effective_stall`` AND
-          there's no active ``silence_budget_until`` AND the kill is
-          enabled (``> 0``), kill the subprocess. The for-loop above
-          then exits on EOF; the post-loop check converts that to a
-          :class:`ProxyStallError`.
-
-        Cancellation requests from ``/v1/cancel/{request_id}`` are also
-        observed here — same kill path, different error class.
-        """
-        while not watchdog_done.is_set():
+    def _idle_monitor() -> None:
+        """Log quiet in-flight requests without enforcing a deadline."""
+        while not monitor_done.is_set():
             if proc.poll() is not None:
                 return
             now = time.monotonic()
-            should_kill_stall = False
-            should_kill_cancel = False
             if state is not None:
                 with state.requests_lock:
                     rec = state.requests.get(request_id)
                     if rec is None:
                         return
-                    if rec.cancel_requested and not rec.cancelled:
-                        should_kill_cancel = True
-                        rec.cancelled = True
-                    elif effective_stall > 0:
-                        idle = now - rec.last_byte_at
-                        budget_until = rec.silence_budget_until
-                        in_budget = budget_until is not None and now < budget_until
-                        if idle > effective_stall and not in_budget:
-                            should_kill_stall = True
-                            rec.stall_killed = True
-                        elif (
-                            now - rec.last_heartbeat_at >= DEFAULT_HEARTBEAT_SECONDS
-                            and idle >= DEFAULT_HEARTBEAT_SECONDS
-                        ):
-                            rec.last_heartbeat_at = now
-                            log.info(
-                                "proxy.idle_heartbeat",
-                                request_id=short_id,
-                                model=model,
-                                idle_s=round(idle, 1),
-                                budget_remaining_s=(
-                                    round(budget_until - now, 1)
-                                    if budget_until is not None and budget_until > now
-                                    else None
-                                ),
-                                budget_reason=rec.silence_budget_reason,
-                            )
-            if should_kill_cancel:
-                log.warning(
-                    "proxy.cancel_kill",
-                    request_id=short_id,
-                    model=model,
-                )
-                with contextlib.suppress(Exception):
-                    proc.kill()
-                return
-            if should_kill_stall:
-                log.warning(
-                    "proxy.stall_kill",
-                    request_id=short_id,
-                    model=model,
-                    threshold_s=round(effective_stall, 1),
-                )
-                with contextlib.suppress(Exception):
-                    proc.kill()
-                return
-            if watchdog_done.wait(timeout=_STALL_POLL_INTERVAL):
+                    idle = now - rec.last_byte_at
+                    if (
+                        now - rec.last_heartbeat_at >= IDLE_HEARTBEAT_SECONDS
+                        and idle >= IDLE_HEARTBEAT_SECONDS
+                    ):
+                        rec.last_heartbeat_at = now
+                        log.info(
+                            "proxy.idle_heartbeat",
+                            request_id=short_id,
+                            model=model,
+                            idle_s=round(idle, 1),
+                        )
+            if monitor_done.wait(timeout=_IDLE_MONITOR_POLL_SECONDS):
                 return
 
-    watchdog: threading.Thread | None = None
+    def _drain_stderr() -> None:
+        stream = proc.stderr
+        if stream is None:
+            return
+        while True:
+            chunk = stream.read(8192)
+            if not chunk:
+                return
+            stderr_chunks.append(chunk)
+
+    monitor: threading.Thread | None = None
     if state is not None:
-        watchdog = threading.Thread(
-            target=_watchdog,
-            name=f"proxy-watchdog-{short_id}",
+        monitor = threading.Thread(
+            target=_idle_monitor,
+            name=f"proxy-idle-monitor-{short_id}",
             daemon=True,
         )
-        watchdog.start()
+        monitor.start()
+
+    stderr_thread = threading.Thread(
+        target=_drain_stderr,
+        name=f"proxy-stderr-drain-{short_id}",
+        daemon=True,
+    )
+    stderr_thread.start()
 
     assert proc.stdout is not None
     try:
         for line_bytes in proc.stdout:
-            if deadline is not None and time.monotonic() > deadline:
-                proc.kill()
-                proc.communicate()
-                raise ProxyError(f"claude --print timed out after {timeout}s")
             now = time.monotonic()
             if state is not None:
                 with state.requests_lock:
@@ -507,35 +492,16 @@ def _invoke_claude(
             )
             tool_calls += new_tool_calls
     finally:
-        watchdog_done.set()
-        # Drain stderr now that stdout is done. ``communicate`` returns
-        # the leftover bytes; we don't need stdout because we already
-        # streamed it.
-        try:
-            _, stderr_bytes = proc.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            _, stderr_bytes = proc.communicate()
+        returncode = proc.wait()
+        monitor_done.set()
         if state is not None:
             state.unregister_request(request_id)
-        if watchdog is not None:
-            watchdog.join(timeout=2)
-
-    # Watchdog may have killed the subprocess; raise the corresponding
-    # error so callers can distinguish stall / cancel from other modes.
-    if record.cancelled:
-        raise ProxyCancelledError(
-            f"claude --print cancelled via /v1/cancel (request_id={short_id})"
-        )
-    if record.stall_killed:
-        raise ProxyStallError(
-            f"claude --print killed by stall watchdog after "
-            f"{round(effective_stall, 1)}s of stdout silence "
-            f"with no idle-silence budget (request_id={short_id})"
-        )
+        if monitor is not None:
+            monitor.join(timeout=2)
+        stderr_thread.join(timeout=2)
 
     stdout_text = "".join(raw_lines)
-    stderr_text = stderr_bytes.decode("utf-8", errors="replace")
+    stderr_text = b"".join(stderr_chunks).decode("utf-8", errors="replace")
 
     try:
         log_path.write_text(stdout_text, encoding="utf-8")
@@ -544,16 +510,20 @@ def _invoke_claude(
 
     if not stdout_text.strip():
         raise ProxyError(
-            f"claude --print returned empty stdout (exit={proc.returncode}); "
+            f"{upstream_label} returned empty stdout (exit={returncode}); "
             f"stderr={stderr_text.strip()[:500]}"
         )
-
-    text, usage = _parse_stream_json(
-        stdout_text, exit_code=proc.returncode, stderr=stderr_text
-    )
+    else:
+        text, usage = _parse_upstream_json(
+            stdout_text,
+            upstream=upstream,
+            exit_code=returncode,
+            stderr=stderr_text,
+        )
     log.info(
         "proxy.upstream_finished",
         request_id=short_id,
+        upstream=upstream,
         model=model,
         duration_s=round(time.monotonic() - started, 2),
         tool_calls=tool_calls,
@@ -580,6 +550,39 @@ def _log_stream_event(
     """
     new_tool_calls = 0
     etype = event.get("type")
+
+    if etype == "thread.started":
+        thread_id = event.get("thread_id", "")
+        log.info(
+            "proxy.session_init",
+            request_id=request_id_short,
+            model=model,
+            session_id=str(thread_id)[:8],
+            tools=None,
+        )
+        return new_tool_calls, saw_first_text
+
+    if etype == "turn.started":
+        log.info(
+            "proxy.turn_started",
+            request_id=request_id_short,
+            model=model,
+            elapsed_s=round(time.monotonic() - started_at, 2),
+        )
+        return new_tool_calls, saw_first_text
+
+    if etype == "turn.completed":
+        usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
+        _merge_usage_from_event(event, usage)
+        log.info(
+            "proxy.turn_completed",
+            request_id=request_id_short,
+            model=model,
+            elapsed_s=round(time.monotonic() - started_at, 2),
+            in_tokens=usage.get("input_tokens", 0),
+            out_tokens=usage.get("output_tokens", 0),
+        )
+        return new_tool_calls, saw_first_text
 
     if etype == "system" and event.get("subtype") == "init":
         session_id = event.get("session_id", "")
@@ -632,7 +635,78 @@ def _log_stream_event(
             elapsed_s=round(time.monotonic() - started_at, 2),
         )
 
+    elif etype in ("item.started", "item.completed", "response_item"):
+        item = event.get("item") if etype != "response_item" else event.get("payload")
+        if isinstance(item, dict):
+            item_type = item.get("type")
+            if item_type in (
+                "toolCall",
+                "function_call",
+                "mcpToolCall",
+                "mcp_tool_call",
+            ):
+                name = (
+                    item.get("name")
+                    or item.get("toolName")
+                    or item.get("tool")
+                    or "?"
+                )
+                tool_id = str(item.get("id") or item.get("call_id") or "")[:12]
+                server = item.get("server")
+                status = item.get("status")
+                if etype == "item.started":
+                    log.info(
+                        "proxy.tool_call",
+                        request_id=request_id_short,
+                        server=str(server) if server is not None else None,
+                        tool=str(name),
+                        tool_id=tool_id,
+                        status=str(status) if status is not None else None,
+                        elapsed_s=round(time.monotonic() - started_at, 2),
+                    )
+                    new_tool_calls = 1
+                else:
+                    log.info(
+                        "proxy.tool_result",
+                        request_id=request_id_short,
+                        server=str(server) if server is not None else None,
+                        tool=str(name),
+                        tool_id=tool_id,
+                        status=str(status) if status is not None else None,
+                        elapsed_s=round(time.monotonic() - started_at, 2),
+                    )
+            elif item_type in (
+                "agentMessage",
+                "agent_message",
+                "assistant_message",
+                "message",
+            ):
+                text = _extract_text_field(cast(dict[str, Any], item))
+                if text is not None:
+                    log.info(
+                        "proxy.agent_update",
+                        request_id=request_id_short,
+                        elapsed_s=round(time.monotonic() - started_at, 2),
+                        chars=len(text),
+                        preview=_preview_text(text),
+                    )
+                if not saw_first_text:
+                    log.info(
+                        "proxy.text_started",
+                        request_id=request_id_short,
+                        elapsed_s=round(time.monotonic() - started_at, 2),
+                    )
+                    saw_first_text = True
+
     return new_tool_calls, saw_first_text
+
+
+def _preview_text(text: str, *, limit: int = 180) -> str:
+    """Short, single-line preview for live proxy logs."""
+    collapsed = " ".join(text.split())
+    if len(collapsed) <= limit:
+        return collapsed
+    return collapsed[: limit - 3] + "..."
 
 
 def _parse_stream_json(
@@ -683,6 +757,164 @@ def _parse_stream_json(
     return result_text, usage
 
 
+def _parse_upstream_json(
+    stdout_text: str,
+    *,
+    upstream: Upstream,
+    exit_code: int,
+    stderr: str,
+) -> tuple[str, dict[str, int]]:
+    if upstream == "codex":
+        return _parse_codex_exec_json(stdout_text, exit_code=exit_code, stderr=stderr)
+    return _parse_stream_json(stdout_text, exit_code=exit_code, stderr=stderr)
+
+
+def _parse_codex_exec_json(
+    stdout_text: str,
+    *,
+    exit_code: int,
+    stderr: str,
+) -> tuple[str, dict[str, int]]:
+    """Walk ``codex exec --json`` output and return (text, usage).
+
+    Codex JSONL has evolved across CLI builds, so this parser deliberately
+    accepts the stable shapes we care about: completed agent-message items
+    and usage objects, whether they arrive top-level or nested under
+    ``item`` / ``payload`` / ``turn``.
+    """
+    result_text: str | None = None
+    usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
+    saw_any_event = False
+
+    for line in stdout_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = cast(dict[str, Any], json.loads(line))
+        except json.JSONDecodeError:
+            continue
+        saw_any_event = True
+        _merge_usage_from_event(event, usage)
+        text = _extract_codex_agent_text(event)
+        if text is not None:
+            result_text = text
+
+    if result_text is None:
+        snippet = stderr.strip()[:500] if stderr.strip() else stdout_text.strip()[-500:]
+        if not saw_any_event:
+            raise ProxyError(
+                f"codex exec produced no JSON events (exit={exit_code}); snippet={snippet}"
+            )
+        raise ProxyError(
+            f"codex exec stream missing agent message (exit={exit_code}); snippet={snippet}"
+        )
+    return result_text, usage
+
+
+def _extract_codex_agent_text(event: dict[str, Any]) -> str | None:
+    candidates: list[dict[str, Any]] = [event]
+    for key in ("item", "payload", "message"):
+        raw = event.get(key)
+        if isinstance(raw, dict):
+            candidates.append(cast(dict[str, Any], raw))
+    turn = event.get("turn")
+    if isinstance(turn, dict):
+        candidates.append(cast(dict[str, Any], turn))
+
+    for obj in candidates:
+        obj_type = obj.get("type")
+        if obj_type not in (
+            "agentMessage",
+            "agent_message",
+            "assistant_message",
+            "message",
+            "final_message",
+        ):
+            continue
+        text = _extract_text_field(obj)
+        if text is not None:
+            return text
+
+    for obj in candidates:
+        for key in ("last_agent_message", "final_response", "finalMessage", "lastMessage"):
+            text = _coerce_optional_text(obj.get(key))
+            if text is not None:
+                return text
+    return None
+
+
+def _extract_text_field(obj: dict[str, Any]) -> str | None:
+    for key in ("text", "content", "message", "output_text"):
+        text = _coerce_optional_text(obj.get(key))
+        if text is not None:
+            return text
+    return None
+
+
+def _coerce_optional_text(raw: Any) -> str | None:
+    if isinstance(raw, str):
+        stripped = raw.strip()
+        return stripped if stripped else None
+    if isinstance(raw, list):
+        text = _coerce_content(raw).strip()
+        return text if text else None
+    if isinstance(raw, dict):
+        return _extract_text_field(cast(dict[str, Any], raw))
+    return None
+
+
+def _merge_usage_from_event(event: dict[str, Any], usage: dict[str, int]) -> None:
+    for raw in (
+        event.get("usage"),
+        event.get("tokenUsage"),
+        event.get("token_usage"),
+    ):
+        _merge_usage(raw, usage)
+
+    for key in ("item", "payload", "turn"):
+        nested = event.get(key)
+        if not isinstance(nested, dict):
+            continue
+        nested_dict = cast(dict[str, Any], nested)
+        for raw in (
+            nested_dict.get("usage"),
+            nested_dict.get("tokenUsage"),
+            nested_dict.get("token_usage"),
+        ):
+            _merge_usage(raw, usage)
+
+
+def _merge_usage(raw: Any, usage: dict[str, int]) -> None:
+    if not isinstance(raw, dict):
+        return
+    raw_dict = cast(dict[str, Any], raw)
+    nested_last = raw_dict.get("last")
+    if isinstance(nested_last, dict):
+        _merge_usage(nested_last, usage)
+
+    input_tokens = _first_int(
+        raw_dict,
+        ("input_tokens", "prompt_tokens", "inputTokens", "promptTokens"),
+    )
+    output_tokens = _first_int(
+        raw_dict,
+        ("output_tokens", "completion_tokens", "outputTokens", "completionTokens"),
+    )
+    if input_tokens is not None:
+        usage["input_tokens"] = input_tokens
+    if output_tokens is not None:
+        usage["output_tokens"] = output_tokens
+
+
+def _first_int(raw: dict[str, Any], keys: tuple[str, ...]) -> int | None:
+    for key in keys:
+        value = raw.get(key)
+        if isinstance(value, int):
+            return value
+    return None
+
+
 def _prune_old_logs(log_dir: Path) -> None:
     if not log_dir.exists():
         return
@@ -701,7 +933,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
     """Per-connection request handler. One instance per request thread."""
 
     state: ClassVar[_State]
-    request_timeout: ClassVar[float | None] = None
 
     server_version = "tasque-proxy/0.1"
     sys_version = ""
@@ -722,14 +953,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if self.path == "/v1/chat/completions":
             self._handle_chat_completions()
             return
-        if self.path.startswith("/v1/internal/idle_grant/"):
-            request_id = self.path[len("/v1/internal/idle_grant/"):]
-            self._handle_idle_grant(request_id)
-            return
-        if self.path.startswith("/v1/cancel/"):
-            request_id = self.path[len("/v1/cancel/"):]
-            self._handle_cancel(request_id)
-            return
         self._send_json(HTTPStatus.NOT_FOUND, {"error": {"message": "not found"}})
 
     # ------------------------------------------------------------------ handlers
@@ -740,7 +963,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         else:
             self._send_json(
                 HTTPStatus.SERVICE_UNAVAILABLE,
-                {"status": "claude CLI unavailable"},
+                {"status": f"{_upstream_executable(self.state.upstream)} CLI unavailable"},
             )
 
     def _handle_status(self) -> None:
@@ -752,18 +975,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
             request_view = [
                 {
                     "request_id": r.request_id,
+                    "upstream": r.upstream,
                     "model": r.model,
                     "elapsed_s": round(now_mono - r.started_at, 1),
                     "last_byte_age_s": round(now_mono - r.last_byte_at, 1),
-                    "silence_budget_remaining_s": (
-                        round(r.silence_budget_until - now_mono, 1)
-                        if r.silence_budget_until is not None
-                        and r.silence_budget_until > now_mono
-                        else None
-                    ),
-                    "silence_budget_seconds": r.silence_budget_seconds,
-                    "silence_budget_reason": r.silence_budget_reason,
-                    "cancel_requested": r.cancel_requested,
                 }
                 for r in self.state.requests.values()
             ]
@@ -772,116 +987,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
             {
                 "in_flight": in_flight,
                 "capacity": self.state.max_concurrent,
+                "upstream": self.state.upstream,
                 "total_requests": total,
                 "last_error": self.state.last_error,
                 "requests": request_view,
             },
-        )
-
-    def _handle_idle_grant(self, request_id: str) -> None:
-        """Tasque-MCP-only endpoint: extend the silence budget for a
-        running ``claude --print`` request.
-
-        Body: ``{"seconds": <number>, "reason": "<short label>"}``. The
-        budget is calculated from *now* — calling twice with the same
-        ``seconds`` does not double it; the larger of (``now + seconds``,
-        existing ``silence_budget_until``) wins. Returns 404 when the
-        request_id is unknown (typical: subprocess already exited or the
-        MCP guessed the wrong id), 400 on a malformed body.
-        """
-        try:
-            body = self._read_json_body()
-        except ValueError as exc:
-            self._send_json(HTTPStatus.BAD_REQUEST, {"error": {"message": str(exc)}})
-            return
-        seconds_raw = body.get("seconds")
-        if seconds_raw is None:
-            self._send_json(
-                HTTPStatus.BAD_REQUEST,
-                {"error": {"message": "seconds must be a positive number"}},
-            )
-            return
-        try:
-            seconds = float(seconds_raw)
-        except (TypeError, ValueError):
-            self._send_json(
-                HTTPStatus.BAD_REQUEST,
-                {"error": {"message": "seconds must be a positive number"}},
-            )
-            return
-        if seconds <= 0:
-            self._send_json(
-                HTTPStatus.BAD_REQUEST,
-                {"error": {"message": "seconds must be > 0"}},
-            )
-            return
-        reason_raw = body.get("reason")
-        reason = (
-            str(reason_raw).strip()
-            if isinstance(reason_raw, str) and reason_raw.strip()
-            else None
-        )
-        now_mono = time.monotonic()
-        new_until = now_mono + seconds
-        with self.state.requests_lock:
-            rec = self.state.requests.get(request_id)
-            if rec is None:
-                self._send_json(
-                    HTTPStatus.NOT_FOUND,
-                    {"error": {"message": f"unknown request_id {request_id!r}"}},
-                )
-                return
-            existing = rec.silence_budget_until
-            chosen_until = (
-                max(existing, new_until) if existing is not None else new_until
-            )
-            rec.silence_budget_until = chosen_until
-            rec.silence_budget_seconds = seconds
-            rec.silence_budget_reason = reason
-            granted_remaining = chosen_until - now_mono
-        granted_until_iso = (
-            datetime.now(UTC) + timedelta(seconds=granted_remaining)
-        ).isoformat()
-        log.info(
-            "proxy.idle_grant",
-            request_id=request_id[:8],
-            seconds=round(seconds, 1),
-            remaining_s=round(granted_remaining, 1),
-            reason=reason,
-        )
-        self._send_json(
-            HTTPStatus.OK,
-            {
-                "ok": True,
-                "request_id": request_id,
-                "granted_until_iso": granted_until_iso,
-                "remaining_s": round(granted_remaining, 1),
-                "reason": reason,
-            },
-        )
-
-    def _handle_cancel(self, request_id: str) -> None:
-        """Operator-facing endpoint: kill a running ``claude --print``.
-
-        Returns 404 when ``request_id`` is unknown (already finished or
-        never started), 200 with ``{"ok": true}`` otherwise. The actual
-        kill happens asynchronously in the watchdog within ~1s of this
-        request returning; the corresponding ``/v1/chat/completions``
-        call will then surface a :class:`ProxyCancelledError` as a 502.
-        """
-        with self.state.requests_lock:
-            rec = self.state.requests.get(request_id)
-            if rec is None:
-                self._send_json(
-                    HTTPStatus.NOT_FOUND,
-                    {"error": {"message": f"unknown request_id {request_id!r}"}},
-                )
-                return
-            rec.cancel_requested = True
-        log.info("proxy.cancel_requested", request_id=request_id[:8])
-        self._send_json(
-            HTTPStatus.OK,
-            {"ok": True, "request_id": request_id},
         )
 
     def _handle_chat_completions(self) -> None:
@@ -927,12 +1037,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self.state.in_flight += 1
                 self.state.total_requests += 1
             try:
-                text, usage = _invoke_claude(
+                text, usage = _invoke_upstream(
+                    upstream=self.state.upstream,
                     model=model,
                     prompt=prompt,
                     request_id=request_id,
                     log_dir=self.state.log_dir,
-                    timeout=self.request_timeout,
                     disallowed_tools=disallowed_tools,
                     state=self.state,
                 )
@@ -1053,33 +1163,30 @@ def make_server(
     *,
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
+    upstream: Upstream | None = None,
     max_concurrent: int | None = None,
     log_dir: Path | None = None,
-    timeout: float | None = None,
 ) -> tuple[ThreadingHTTPServer, _State]:
     """Wire up the handler class with shared state and return (server, state)."""
     cap = max_concurrent if max_concurrent is not None else _env_max_concurrent()
+    resolved_upstream = upstream if upstream is not None else _env_upstream()
     resolved_log_dir = log_dir if log_dir is not None else _env_log_dir()
-    resolved_timeout = timeout if timeout is not None else _env_timeout()
 
     resolved_log_dir.mkdir(parents=True, exist_ok=True)
     _prune_old_logs(resolved_log_dir)
 
-    state = _State(max_concurrent=cap, log_dir=resolved_log_dir)
+    state = _State(
+        max_concurrent=cap,
+        log_dir=resolved_log_dir,
+        upstream=resolved_upstream,
+    )
 
     handler_cls = type(
         "BoundProxyHandler",
         (ProxyHandler,),
-        {"state": state, "request_timeout": resolved_timeout},
+        {"state": state},
     )
     server = ThreadingHTTPServer((host, port), cast(Any, handler_cls))
-    # Pin the public-facing URL the tasque MCP uses to call the proxy's
-    # internal endpoints (``/v1/internal/idle_grant/<request_id>``).
-    # ``host=0.0.0.0`` would bind all interfaces but the MCP runs on
-    # the same machine, so 127.0.0.1 is the right address to publish.
-    bound_host, bound_port = server.server_address[0], server.server_address[1]
-    advertised_host = "127.0.0.1" if bound_host in ("0.0.0.0", "::") else bound_host
-    state.internal_base_url = f"http://{advertised_host}:{bound_port}"
     return server, state
 
 
@@ -1089,9 +1196,13 @@ def _env_max_concurrent() -> int:
         return DEFAULT_MAX_CONCURRENT
     try:
         value = int(raw)
-    except ValueError:
-        return DEFAULT_MAX_CONCURRENT
-    return max(1, value)
+    except ValueError as exc:
+        raise ProxyError(
+            f"TASQUE_PROXY_MAX_CONCURRENT must be an integer, got {raw!r}"
+        ) from exc
+    if value < 1:
+        raise ProxyError(f"TASQUE_PROXY_MAX_CONCURRENT must be >= 1, got {value}")
+    return value
 
 
 def _env_log_dir() -> Path:
@@ -1099,23 +1210,13 @@ def _env_log_dir() -> Path:
     return Path(raw) if raw else Path("data") / "proxy-logs"
 
 
-def _env_timeout() -> float | None:
-    raw = os.environ.get("TASQUE_PROXY_TIMEOUT")
-    if raw is None:
-        return None
-    try:
-        return float(raw)
-    except ValueError:
-        return None
-
-
 def serve(
     *,
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
+    upstream: Upstream | None = None,
     max_concurrent: int | None = None,
     log_dir: Path | None = None,
-    timeout: float | None = None,
     iterations: Iterable[None] | None = None,  # tests can pass [None] for one-shot
 ) -> None:
     """Start the proxy and block until interrupted.
@@ -1127,18 +1228,18 @@ def serve(
     server, state = make_server(
         host=host,
         port=port,
+        upstream=upstream,
         max_concurrent=max_concurrent,
         log_dir=log_dir,
-        timeout=timeout,
     )
     log.info(
         "proxy.start",
         host=host,
         port=port,
+        upstream=state.upstream,
         max_concurrent=state.max_concurrent,
         log_dir=str(state.log_dir),
-        timeout=timeout,
-        claude_cwd=str(_claude_cwd()),
+        upstream_cwd=str(_upstream_cwd(state.upstream)),
     )
     try:
         if iterations is None:

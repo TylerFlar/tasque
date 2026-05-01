@@ -22,16 +22,16 @@ def _spec_two_workers_then_approval() -> dict[str, Any]:
         "chain_name": "dlq-demo",
         "bucket": "personal",
         "recurrence": None,
-        "planner_tier": "opus",
+        "planner_tier": "large",
         "plan": [
-            {"id": "scan", "kind": "worker", "directive": "scan", "tier": "haiku"},
+            {"id": "scan", "kind": "worker", "directive": "scan", "tier": "small"},
             {
                 "id": "filter",
                 "kind": "worker",
                 "directive": "filter",
                 "depends_on": ["scan"],
                 "consumes": ["scan"],
-                "tier": "haiku",
+                "tier": "small",
             },
         ],
     }
@@ -103,10 +103,10 @@ def test_dlq_retry_returns_false_for_step_not_failed(
         "chain_name": "ok-chain",
         "bucket": "personal",
         "recurrence": None,
-        "planner_tier": "opus",
+        "planner_tier": "large",
         "plan": [
-            {"id": "a", "kind": "worker", "directive": "x", "tier": "haiku"},
-            {"id": "b", "kind": "worker", "directive": "y", "depends_on": ["a"], "consumes": ["a"], "tier": "haiku"},
+            {"id": "a", "kind": "worker", "directive": "x", "tier": "small"},
+            {"id": "b", "kind": "worker", "directive": "y", "depends_on": ["a"], "consumes": ["a"], "tier": "small"},
         ],
     }
     chain_id = launch_chain_run(spec)
@@ -133,9 +133,9 @@ def test_dlq_retry_via_jobs_dlq_hook(monkeypatch: pytest.MonkeyPatch) -> None:
         "chain_name": "dlq-via-job",
         "bucket": "personal",
         "recurrence": None,
-        "planner_tier": "opus",
+        "planner_tier": "large",
         "plan": [
-            {"id": "only", "kind": "worker", "directive": "x", "tier": "haiku"},
+            {"id": "only", "kind": "worker", "directive": "x", "tier": "small"},
         ],
     }
     chain_id = launch_chain_run(spec)
@@ -217,9 +217,9 @@ def test_resume_interrupted_chains_retries_failed_steps(
         "chain_name": "wedge-on-fanout",
         "bucket": "personal",
         "recurrence": None,
-        "planner_tier": "opus",
+        "planner_tier": "large",
         "plan": [
-            {"id": "sources", "kind": "worker", "directive": "list", "tier": "haiku"},
+            {"id": "sources", "kind": "worker", "directive": "list", "tier": "small"},
             {
                 "id": "pull",
                 "kind": "worker",
@@ -227,7 +227,7 @@ def test_resume_interrupted_chains_retries_failed_steps(
                 "depends_on": ["sources"],
                 "consumes": ["sources"],
                 "fan_out_on": "items",
-                "tier": "haiku",
+                "tier": "small",
             },
             {
                 "id": "consolidate",
@@ -235,7 +235,7 @@ def test_resume_interrupted_chains_retries_failed_steps(
                 "directive": "roll up",
                 "depends_on": ["pull"],
                 "consumes": ["pull"],
-                "tier": "haiku",
+                "tier": "small",
             },
         ],
     }

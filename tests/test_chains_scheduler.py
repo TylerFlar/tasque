@@ -40,8 +40,8 @@ def _seed_template(
         "chain_name": name,
         "bucket": "personal",
         "recurrence": recurrence,
-        "planner_tier": "opus",
-        "plan": [{"id": "a", "kind": "worker", "directive": "do A", "tier": "haiku"}],
+        "planner_tier": "large",
+        "plan": [{"id": "a", "kind": "worker", "directive": "do A", "tier": "small"}],
     }
     with get_session() as sess:
         row = ChainTemplate(

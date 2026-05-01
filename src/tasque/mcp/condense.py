@@ -1,4 +1,4 @@
-"""Auto-condense oversize MCP read-tool results via the haiku tier.
+"""Auto-condense oversize MCP read-tool results via the small tier.
 
 Read tools (`note_search`, `chain_run_get` with `include_state=True`,
 `job_list`, etc.) can return tens of kilobytes of JSON. Loading that
@@ -10,13 +10,13 @@ craft-agents pattern:
    sentence the calling LLM writes describing what it actually wants
    from the tool. ("which durable health notes mention sleep").
 2. After the tool runs, if the JSON result exceeds a byte threshold,
-   we route it plus the intent through a haiku call that returns a
+   we route it plus the intent through a small-tier call that returns a
    condensed JSON envelope.
 3. The agent receives either the original result (under threshold) or
    ``{"_condensed": True, "_original_bytes": N, "_intent": "...",
    "_tool": "...", "summary": "..."}``.
 
-Condensation is best-effort: if the haiku call fails (proxy down, env
+Condensation is best-effort: if the small-tier call fails (proxy down, env
 mismatch, transport error) we return the original verbatim. Better an
 oversize correct response than a lost one.
 
@@ -62,8 +62,8 @@ _CONDENSE_SYSTEM = (
 )
 
 
-def _condense_via_haiku(result_json: str, *, intent: str, tool_name: str) -> str:
-    """Invoke the haiku tier through the tasque proxy.
+def _condense_via_small(result_json: str, *, intent: str, tool_name: str) -> str:
+    """Invoke the small tier through the tasque proxy.
 
     Imports lazily so the MCP module's import cost stays bounded —
     ``langchain_openai`` is a heavy dependency and most MCP calls don't
@@ -71,7 +71,7 @@ def _condense_via_haiku(result_json: str, *, intent: str, tool_name: str) -> str
     """
     from tasque.llm.factory import get_chat_model_for_tier
 
-    chat = get_chat_model_for_tier("haiku", temperature=0)
+    chat = get_chat_model_for_tier("small", temperature=0)
     msgs: list[tuple[str, str]] = [
         ("system", _CONDENSE_SYSTEM),
         (
@@ -114,7 +114,7 @@ def maybe_condense(result_json: str, *, intent: str, tool_name: str) -> str:
     if not intent.strip():
         return result_json
     try:
-        summary = _condense_via_haiku(
+        summary = _condense_via_small(
             result_json, intent=intent.strip(), tool_name=tool_name
         )
     except Exception as exc:

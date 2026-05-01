@@ -20,9 +20,8 @@ import structlog
 import typer
 
 from tasque.chains.scheduler import (
-    DEFAULT_STALE_RESUME_THRESHOLD_SECONDS,
-    resume_interrupted_chains,
-    resume_stale_chains,
+    DEFAULT_CHAIN_LEASE_SECONDS,
+    claim_and_run_ready_chains,
 )
 from tasque.coach.trigger import run_drainer
 from tasque.discord import poster
@@ -33,64 +32,45 @@ from tasque.discord.worker_run_watcher import run_worker_run_watcher
 from tasque.jobs.scheduler import start_scheduler
 
 DEFAULT_BOT_READY_TIMEOUT_SECONDS = 30.0
-# How often the daemon sweeps for chains whose runner thread died with
-# the calling process (e.g. an MCP-fired chain in a finished
-# ``claude --print`` subprocess). Independent of
-# :data:`DEFAULT_STALE_RESUME_THRESHOLD_SECONDS` — the tick is the
-# polling cadence (cheap; runs against the in-process active-invoke
-# registry first), the threshold is the staleness gate that decides
-# whether a stale-looking row is actually wedged.
-DEFAULT_STALE_RESUME_TICK_SECONDS = 30.0
+# How often the daemon looks for unowned chain runs. Chain execution is
+# daemon-owned: external MCP callers only enqueue rows, and this loop
+# claims them with a durable DB lease before invoking LangGraph.
+DEFAULT_CHAIN_RUNNER_TICK_SECONDS = 5.0
 
 
 async def run_chain_resume_ticker(
     *,
     stop: asyncio.Event,
-    interval_seconds: float = DEFAULT_STALE_RESUME_TICK_SECONDS,
-    threshold_seconds: float = DEFAULT_STALE_RESUME_THRESHOLD_SECONDS,
+    interval_seconds: float = DEFAULT_CHAIN_RUNNER_TICK_SECONDS,
+    lease_seconds: float = DEFAULT_CHAIN_LEASE_SECONDS,
 ) -> None:
-    """Drive every chain-resume pass on this daemon.
+    """Drive daemon-owned chain execution.
 
-    First iteration: :func:`resume_interrupted_chains` — full boot
-    semantics, including resetting ``failed`` plan nodes back to
-    ``pending`` so transient errors get retried after restart.
-
-    Subsequent iterations (every ``interval_seconds``):
-    :func:`resume_stale_chains` — staleness-filtered, no failure
-    reset. Picks up chains whose runner thread died with the calling
-    process (e.g. an MCP-fired chain whose ``claude --print``
-    subprocess exited mid-invoke).
-
-    Single source of truth: prior iterations of this codebase had a
-    one-shot boot resume task running concurrently with the periodic
-    ticker, which double-dispatched the same step on startup whenever
-    the boot resume's checkpoint was already stale. Folding the boot
-    pass into the ticker's first iteration eliminates the race.
-
-    Each invocation runs in a worker thread so a long-running
-    ``graph.invoke`` doesn't block the asyncio loop. Ticks are
-    sequential — the next sleep begins after the previous invoke
-    returns, so a tick that takes longer than ``interval_seconds``
-    just delays the next one rather than overlapping.
+    External callers only create ``ChainRun`` rows. This ticker claims
+    one runnable row at a time with a durable lease, invokes the graph,
+    and extends the lease while work is active. The first pass retries
+    failed in-checkpoint steps for boot recovery; later passes leave
+    failure state alone. Ticks are sequential, so a long graph run
+    delays the next claim rather than overlapping it.
     """
     log_local = structlog.get_logger(__name__)
+    owner_id = f"serve-{id(stop):x}"
     is_first_tick = True
 
     while not stop.is_set():
         try:
-            if is_first_tick:
-                resumed = await asyncio.to_thread(resume_interrupted_chains)
-                if resumed:
-                    log_local.info("serve.resumed_chains", count=len(resumed))
-                is_first_tick = False
-            else:
-                resumed = await asyncio.to_thread(
-                    resume_stale_chains, threshold_seconds=threshold_seconds
-                )
-                if resumed:
-                    log_local.info("serve.chain_resume_tick", resumed=len(resumed))
+            ran = await asyncio.to_thread(
+                claim_and_run_ready_chains,
+                owner_id=owner_id,
+                max_runs=1,
+                lease_seconds=lease_seconds,
+                reset_failed=is_first_tick,
+            )
+            if ran:
+                log_local.info("serve.chain_runner_tick", ran=len(ran))
+            is_first_tick = False
         except Exception:
-            log_local.exception("serve.chain_resume_tick_failed")
+            log_local.exception("serve.chain_runner_tick_failed")
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval_seconds)
             return
@@ -136,7 +116,7 @@ async def _run_async(*, drainer_poll_seconds: float) -> None:
 
     Order matters: bring the Discord bot up *first* and wait for
     ``on_ready`` before starting any component that hits the LLM proxy.
-    Otherwise ``resume_interrupted_chains``, the APScheduler ticks
+    Otherwise the chain runner, the APScheduler ticks
     (``fire_due_chain_templates`` and ``claim_and_run_one``), and the
     coach drainer all start dispatching worker calls during the gateway
     handshake — chain status panels never get posted because the watcher
@@ -189,12 +169,9 @@ async def _run_async(*, drainer_poll_seconds: float) -> None:
         name="tasque-coach-drainer",
     )
 
-    # Single source of truth for chain resumes: the ticker's first
-    # iteration runs the boot ``resume_interrupted_chains`` pass (with
-    # failed-step reset), then it periodically runs the lighter
-    # staleness-only ``resume_stale_chains``. Folding both into one
-    # task prevents the boot/tick race that double-dispatched the same
-    # step on startup.
+    # Single source of truth for chain execution: the ticker claims
+    # durable ChainRun rows with a DB lease. Its first iteration also
+    # enables failed-step reset for boot recovery.
     chain_resume_stop = asyncio.Event()
     chain_resume_task = asyncio.create_task(
         run_chain_resume_ticker(stop=chain_resume_stop),

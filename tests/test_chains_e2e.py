@@ -61,9 +61,9 @@ def _3_step_spec() -> dict[str, Any]:
         "chain_name": "e2e-demo",
         "bucket": "personal",
         "recurrence": None,
-        "planner_tier": "opus",
+        "planner_tier": "large",
         "plan": [
-            {"id": "scan", "kind": "worker", "directive": "scan", "tier": "haiku"},
+            {"id": "scan", "kind": "worker", "directive": "scan", "tier": "small"},
             {
                 "id": "filter",
                 "kind": "worker",
@@ -71,7 +71,7 @@ def _3_step_spec() -> dict[str, Any]:
                 "depends_on": ["scan"],
                 "consumes": ["scan"],
                 "fan_out_on": "items",
-                "tier": "haiku",
+                "tier": "small",
             },
             {
                 "id": "notify",
@@ -93,14 +93,13 @@ def test_three_step_chain_runs_and_pauses_at_approval(fake_worker_runner: dict[s
     assert "filter[0]" in invoked_steps
     assert "filter[1]" in invoked_steps
 
-    # The chain must have paused at the approval interrupt — the row's
-    # status is still "running" (the run isn't finalized).
+    # The chain must have paused at the approval interrupt.
     with get_session() as sess:
         row = sess.execute(
             ChainRun.__table__.select().where(ChainRun.chain_id == chain_id)
         ).mappings().first()
         assert row is not None
-        assert row["status"] == "running"
+        assert row["status"] == "awaiting_approval"
 
     # And the notify approval should be in awaiting state per the
     # checkpoint (the snapshot reports "running" at the moment of dispatch
@@ -200,11 +199,11 @@ def test_launch_vars_reach_every_worker_call(monkeypatch: pytest.MonkeyPatch) ->
         "chain_name": "vars-demo",
         "bucket": "personal",
         "recurrence": None,
-        "planner_tier": "opus",
+        "planner_tier": "large",
         # Spec-level static vars.
         "vars": {"force": False, "tag": "static"},
         "plan": [
-            {"id": "scan", "kind": "worker", "directive": "scan", "tier": "haiku"},
+            {"id": "scan", "kind": "worker", "directive": "scan", "tier": "small"},
             {
                 "id": "filter",
                 "kind": "worker",
@@ -212,7 +211,7 @@ def test_launch_vars_reach_every_worker_call(monkeypatch: pytest.MonkeyPatch) ->
                 "depends_on": ["scan"],
                 "consumes": ["scan"],
                 "fan_out_on": "items",
-                "tier": "haiku",
+                "tier": "small",
             },
         ],
     }
@@ -229,14 +228,12 @@ def test_launch_vars_reach_every_worker_call(monkeypatch: pytest.MonkeyPatch) ->
 
 def test_launch_with_wait_false_returns_quickly(monkeypatch: pytest.MonkeyPatch) -> None:
     """``wait=False`` returns the chain_id without blocking on graph
-    invocation. The chain runs on a daemon thread; we wait for that
-    thread to drain before assertions so the in-memory checkpointer
-    has settled."""
-    import threading
+    invocation. The daemon-owned runner claims the row later."""
     import time
 
-    invocation_started = threading.Event()
-    invocation_finished = threading.Event()
+    from tasque.chains import scheduler as sched
+
+    invoked = False
 
     def _fake(
         job: Any, *,
@@ -244,7 +241,8 @@ def test_launch_with_wait_false_returns_quickly(monkeypatch: pytest.MonkeyPatch)
         vars: dict[str, Any] | None = None,
         **_: Any,
     ) -> WorkerResult:
-        invocation_started.set()
+        nonlocal invoked
+        invoked = True
         # Simulate a slow worker so we can verify launch_chain_run
         # returned BEFORE the worker finished.
         time.sleep(0.2)
@@ -257,9 +255,9 @@ def test_launch_with_wait_false_returns_quickly(monkeypatch: pytest.MonkeyPatch)
         "chain_name": "wait-false-demo",
         "bucket": "personal",
         "recurrence": None,
-        "planner_tier": "opus",
+        "planner_tier": "large",
         "plan": [
-            {"id": "only", "kind": "worker", "directive": "do thing", "tier": "haiku"},
+            {"id": "only", "kind": "worker", "directive": "do thing", "tier": "small"},
         ],
     }
 
@@ -270,22 +268,11 @@ def test_launch_with_wait_false_returns_quickly(monkeypatch: pytest.MonkeyPatch)
     # Returned in well under the 0.2s worker sleep.
     assert elapsed < 0.15, f"launch_chain_run blocked for {elapsed:.3f}s with wait=False"
     assert chain_id
+    assert invoked is False
 
-    # Wait for the background thread to actually run the chain so the
-    # rest of the test suite isn't racing it.
-    assert invocation_started.wait(timeout=2.0)
-    # Give the graph time to finalize.
-    deadline = time.monotonic() + 5.0
-    while time.monotonic() < deadline:
-        with get_session() as sess:
-            row = sess.execute(
-                ChainRun.__table__.select().where(ChainRun.chain_id == chain_id)
-            ).mappings().first()
-            assert row is not None
-            if row["status"] != "running":
-                break
-        time.sleep(0.05)
-    invocation_finished.set()
+    ran = sched.claim_and_run_ready_chains(owner_id="test-daemon", max_runs=1)
+    assert ran == [chain_id]
+    assert invoked is True
 
     with get_session() as sess:
         row = sess.execute(
@@ -320,30 +307,31 @@ def test_resume_stale_chains_skips_fresh_checkpoints(
     assert resumed == []
 
 
-def test_resume_stale_chains_picks_up_stale_running_row(
+def test_daemon_runner_picks_up_unstarted_running_row(
     fake_worker_runner: dict[str, Any],
 ) -> None:
-    """A chain whose checkpoint is older than the threshold appears in
-    the resumed list. Simulates an MCP-fired chain whose
-    ``claude --print`` subprocess died mid-invoke and left a stale
-    ``running`` row.
-    """
-    from datetime import UTC, datetime, timedelta
-
+    """wait=False only enqueues; the daemon runner claims and invokes it."""
     from tasque.chains import scheduler as sched
 
-    chain_id = launch_chain_run(_3_step_spec())
-    # Force back to 'running' so the where clause picks it up.
+    spec: dict[str, Any] = {
+        "chain_name": "queued-demo",
+        "bucket": "personal",
+        "recurrence": None,
+        "planner_tier": "large",
+        "plan": [
+            {"id": "only", "kind": "worker", "directive": "do thing", "tier": "small"},
+        ],
+    }
+    chain_id = launch_chain_run(spec, wait=False)
+
+    ran = sched.claim_and_run_ready_chains(owner_id="test-daemon", max_runs=1)
+    assert ran == [chain_id]
     with get_session() as sess:
-        sess.execute(
-            ChainRun.__table__.update()
-            .where(ChainRun.chain_id == chain_id)
-            .values(status="running")
-        )
-    # threshold=0.0 + now=far_future ⇒ every row counts as stale.
-    future = datetime.now(UTC) + timedelta(hours=1)
-    resumed = sched.resume_stale_chains(threshold_seconds=0.0, now=future)
-    assert resumed == [chain_id]
+        row = sess.execute(
+            ChainRun.__table__.select().where(ChainRun.chain_id == chain_id)
+        ).mappings().first()
+        assert row is not None
+        assert row["status"] == "completed"
 
 
 def test_resume_stale_chains_ignores_non_running_status(
@@ -362,9 +350,9 @@ def test_resume_stale_chains_ignores_non_running_status(
         "chain_name": "completed-demo",
         "bucket": "personal",
         "recurrence": None,
-        "planner_tier": "opus",
+        "planner_tier": "large",
         "plan": [
-            {"id": "only", "kind": "worker", "directive": "do thing", "tier": "haiku"},
+            {"id": "only", "kind": "worker", "directive": "do thing", "tier": "small"},
         ],
     }
     chain_id = launch_chain_run(spec)
@@ -402,6 +390,58 @@ def test_resume_stale_chains_skips_active_invoke_even_when_stale(
     finally:
         sched._mark_invoke_inactive(chain_id)
     assert chain_id not in resumed
+
+
+def test_resume_stale_chains_skips_fresh_persistent_heartbeat(
+    fake_worker_runner: dict[str, Any],
+) -> None:
+    """A chain can be alive in another process, so stale resume must
+    honor the persistent ChainRun heartbeat as well as the local active
+    registry."""
+    from datetime import UTC, datetime, timedelta
+
+    from tasque.chains import scheduler as sched
+
+    chain_id = launch_chain_run(_3_step_spec())
+    future = datetime.now(UTC) + timedelta(hours=1)
+    fresh_heartbeat = future.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    with get_session() as sess:
+        sess.execute(
+            ChainRun.__table__.update()
+            .where(ChainRun.chain_id == chain_id)
+            .values(status="running", last_heartbeat=fresh_heartbeat)
+        )
+
+    resumed = sched.resume_stale_chains(threshold_seconds=30.0, now=future)
+    assert resumed == []
+
+
+def test_bump_chain_heartbeat_updates_persistent_liveness(
+    fake_worker_runner: dict[str, Any],
+) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from tasque.chains import scheduler as sched
+
+    chain_id = launch_chain_run(_3_step_spec())
+    stale = (datetime.now(UTC) - timedelta(hours=1)).strftime(
+        "%Y-%m-%dT%H:%M:%S.%fZ"
+    )
+    with get_session() as sess:
+        sess.execute(
+            ChainRun.__table__.update()
+            .where(ChainRun.chain_id == chain_id)
+            .values(last_heartbeat=stale)
+        )
+
+    assert sched._bump_chain_heartbeat(chain_id)
+
+    with get_session() as sess:
+        row = sess.execute(
+            ChainRun.__table__.select().where(ChainRun.chain_id == chain_id)
+        ).mappings().first()
+        assert row is not None
+        assert row["last_heartbeat"] != stale
 
 
 def test_active_invoke_registry_clears_after_launch_returns(
@@ -467,13 +507,13 @@ def test_produces_schema_violation_flips_step_to_failed(
         "chain_name": "schema-demo",
         "bucket": "personal",
         "recurrence": None,
-        "planner_tier": "opus",
+        "planner_tier": "large",
         "plan": [
             {
                 "id": "agg",
                 "kind": "worker",
                 "directive": "aggregate",
-                "tier": "haiku",
+                "tier": "small",
                 "produces_schema": {
                     "required": ["branches"],
                     "list_items": {
@@ -517,9 +557,9 @@ def test_launch_vars_default_to_empty_dict(monkeypatch: pytest.MonkeyPatch) -> N
         "chain_name": "vars-default-demo",
         "bucket": "personal",
         "recurrence": None,
-        "planner_tier": "opus",
+        "planner_tier": "large",
         "plan": [
-            {"id": "only", "kind": "worker", "directive": "do thing", "tier": "haiku"},
+            {"id": "only", "kind": "worker", "directive": "do thing", "tier": "small"},
         ],
     }
     launch_chain_run(spec)

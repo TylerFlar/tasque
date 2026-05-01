@@ -33,7 +33,7 @@ def _node(**kwargs: Any) -> PlanNode:
         "failure_reason": None,
         "fan_out_index": None,
         "fan_out_item": None,
-        "tier": "haiku",
+        "tier": "small",
     }
     base.update(kwargs)
     # Approval steps must NOT carry a tier — the supervisor doesn't

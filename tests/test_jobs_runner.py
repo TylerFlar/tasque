@@ -25,7 +25,7 @@ def _make_job(**overrides: Any) -> QueuedJob:
         fire_at="now",
         status="pending",
         queued_by="test",
-        tier="haiku",
+        tier="small",
     )
     defaults.update(overrides)
     return write_entity(QueuedJob(**defaults))

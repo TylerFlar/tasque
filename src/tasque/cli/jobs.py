@@ -59,8 +59,8 @@ def cmd_queue(
         typer.Option(
             "--tier",
             help=(
-                "Model tier the worker runs at: 'opus', 'sonnet', or "
-                "'haiku'. REQUIRED — every job must declare its tier."
+                "Model tier the worker runs at: 'large', 'medium', or "
+                "'small'. REQUIRED — every job must declare its tier."
             ),
         ),
     ],

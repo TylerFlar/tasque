@@ -24,7 +24,7 @@ The user wants to add a long-horizon goal, look at the cross-bucket picture, or 
 
 You may also: update or drop existing Aims (`update_aim(aim_id, status="dropped"|"completed", ...)` or content edits); survey state on demand (`list_aims`, `list_buckets_summary`, `list_recent_signals`); create or edit recurring chain templates (`create_chain_template`, `update_chain_template`, `queue_chain` for ad-hoc).
 
-When you create a chain (template or one-shot), the spec MUST include `planner_tier` (one of `"opus"` / `"sonnet"` / `"haiku"`; opus is the default workhorse for replanning) AND every worker step MUST include a per-step `tier` from the same set. Pick **haiku** for trivial nudges or static JSON emits, **sonnet** for multi-step tool / scrape / summarize work and conditional branching, **opus** for agentic planning, code iteration, or deep creative generation. Approval steps must NOT include a tier — they don't call an LLM.
+When you create a chain (template or one-shot), the spec MUST include `planner_tier` (one of `"large"` / `"medium"` / `"small"`; large is the default workhorse for replanning) AND every worker step MUST include a per-step `tier` from the same set. Pick **small** for trivial nudges or static JSON emits, **medium** for multi-step tool / scrape / summarize work and conditional branching, **large** for agentic planning, code iteration, or deep creative generation. Approval steps must NOT include a tier — they don't call an LLM.
 
 Ambiguous request → one clarifying question. Plain prose reply, no JSON, terse.
 

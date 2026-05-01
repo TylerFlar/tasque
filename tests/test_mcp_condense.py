@@ -2,9 +2,9 @@
 
 The condense layer is best-effort: it must never raise, and it must
 preserve the original payload unless every precondition is met (size
-over threshold, non-empty intent, haiku call succeeds, valid envelope
+over threshold, non-empty intent, small-tier call succeeds, valid envelope
 produced). These tests pin those invariants without requiring a live
-proxy — the haiku call is monkeypatched per test.
+proxy — the small-tier call is monkeypatched per test.
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ def test_over_threshold_with_intent_invokes_condenser(
         captured["tool_name"] = tool_name
         return "[condensed]"
 
-    monkeypatch.setattr(condense, "_condense_via_haiku", fake_condense)
+    monkeypatch.setattr(condense, "_condense_via_small", fake_condense)
     monkeypatch.delenv("TASQUE_MCP_CONDENSE_THRESHOLD", raising=False)
 
     out = condense.maybe_condense(
@@ -62,14 +62,14 @@ def test_over_threshold_with_blank_intent_returns_original(
     def boom(result_json: str, *, intent: str, tool_name: str) -> str:
         raise AssertionError("should not be called when intent is blank")
 
-    monkeypatch.setattr(condense, "_condense_via_haiku", boom)
+    monkeypatch.setattr(condense, "_condense_via_small", boom)
     monkeypatch.delenv("TASQUE_MCP_CONDENSE_THRESHOLD", raising=False)
 
     out = condense.maybe_condense(big, intent="   ", tool_name="note_search")
     assert out == big
 
 
-def test_haiku_failure_returns_original_payload(
+def test_small_tier_failure_returns_original_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     big = json.dumps({"data": "x" * 70_000})
@@ -77,7 +77,7 @@ def test_haiku_failure_returns_original_payload(
     def explode(result_json: str, *, intent: str, tool_name: str) -> str:
         raise RuntimeError("proxy unreachable")
 
-    monkeypatch.setattr(condense, "_condense_via_haiku", explode)
+    monkeypatch.setattr(condense, "_condense_via_small", explode)
     monkeypatch.delenv("TASQUE_MCP_CONDENSE_THRESHOLD", raising=False)
 
     out = condense.maybe_condense(big, intent="anything", tool_name="job_list")
@@ -91,7 +91,7 @@ def test_threshold_env_override_lowers_trigger_point(
 
     monkeypatch.setattr(
         condense,
-        "_condense_via_haiku",
+        "_condense_via_small",
         lambda result_json, *, intent, tool_name: "[tiny-condensed]",
     )
 
@@ -111,7 +111,7 @@ def test_threshold_env_override_invalid_value_falls_back_to_default(
     def boom(result_json: str, *, intent: str, tool_name: str) -> str:
         raise AssertionError("default threshold should keep us under")
 
-    monkeypatch.setattr(condense, "_condense_via_haiku", boom)
+    monkeypatch.setattr(condense, "_condense_via_small", boom)
     out = condense.maybe_condense(
         json.dumps({"x": "y"}), intent="i", tool_name="note_get"
     )
@@ -126,6 +126,6 @@ def test_threshold_env_override_zero_falls_back_to_default(
     def boom(result_json: str, *, intent: str, tool_name: str) -> str:
         raise AssertionError("zero is invalid; default keeps us under threshold")
 
-    monkeypatch.setattr(condense, "_condense_via_haiku", boom)
+    monkeypatch.setattr(condense, "_condense_via_small", boom)
     out = condense.maybe_condense('{"x": 1}', intent="i", tool_name="note_get")
     assert out == '{"x": 1}'

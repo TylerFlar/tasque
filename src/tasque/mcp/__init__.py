@@ -1,8 +1,8 @@
 """tasque MCP server — full read/write access to the daemon's memory,
 queued jobs, chain templates, and chain runs over stdio.
 
-Registered under the user's ``~/.claude.json`` so every ``claude --print``
-call routed through the tasque proxy inherits the tool catalog. That
+Registered under the user's host MCP config so every upstream call routed
+through the tasque proxy inherits the tool catalog. That
 puts the same write surface in front of every LLM the daemon spawns
 (reactive coach, worker, chain planner, strategist, reply coach) — they
 all get to fire chains, queue jobs, edit templates, and write notes

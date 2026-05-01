@@ -1,11 +1,11 @@
 """``tasque mcp`` — run the tasque stdio MCP server.
 
-Registered in the user's ``~/.claude.json`` so every ``claude --print``
-invocation routed through the tasque proxy inherits the tasque tool
-catalog. Spawned per request by the host (claude CLI), so this command
-stays alive only for the duration of one MCP session.
+Registered in the user's host MCP config so every upstream invocation
+routed through the tasque proxy inherits the tasque tool catalog.
+Spawned per request by the host CLI, so this command stays alive only
+for the duration of one MCP session.
 
-Example registration in ``~/.claude.json`` (under ``mcpServers``):
+Example registration under ``mcpServers``:
 
     "tasque": {
         "command": "tasque",
@@ -21,7 +21,7 @@ import typer
 from tasque.mcp.server import run_stdio
 
 mcp_app = typer.Typer(
-    help="Run the tasque stdio MCP server (registered in ~/.claude.json).",
+    help="Run the tasque stdio MCP server (registered in your MCP host).",
     invoke_without_command=True,
     add_completion=False,
 )

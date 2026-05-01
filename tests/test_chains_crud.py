@@ -26,9 +26,9 @@ def _spec(**overrides: object) -> dict[str, object]:
         "chain_name": "demo",
         "bucket": "personal",
         "recurrence": None,
-        "planner_tier": "opus",
+        "planner_tier": "large",
         "plan": [
-            {"id": "a", "kind": "worker", "directive": "do A", "tier": "haiku"},
+            {"id": "a", "kind": "worker", "directive": "do A", "tier": "small"},
             {
                 "id": "b",
                 "kind": "approval",
@@ -81,7 +81,7 @@ def test_create_chain_template_rejects_duplicate_name() -> None:
 def test_update_chain_template_replaces_plan() -> None:
     create_chain_template(_spec())
     new_spec = _spec(plan=[
-        {"id": "x", "kind": "worker", "directive": "new", "tier": "haiku"},
+        {"id": "x", "kind": "worker", "directive": "new", "tier": "small"},
     ])
     assert update_chain_template("demo", plan_dict=new_spec) is True
     row = get_chain_template("demo")
@@ -166,7 +166,7 @@ def test_reload_templates_skips_llm_edited_row(tmp_path: Path) -> None:
 
     # Simulate an LLM-side edit through the CRUD path.
     new_spec = _spec(plan=[
-        {"id": "x", "kind": "worker", "directive": "llm-edited", "tier": "haiku"},
+        {"id": "x", "kind": "worker", "directive": "llm-edited", "tier": "small"},
     ])
     update_chain_template("demo", plan_dict=new_spec)
 

@@ -35,6 +35,8 @@ def _set_run_status(chain_id: str, status: str, *, ended: bool = False) -> bool:
         if row is None:
             return False
         row.status = status
+        row.lease_owner = None
+        row.lease_expires_at = None
         row.updated_at = utc_now_iso()
         if ended:
             row.ended_at = utc_now_iso()

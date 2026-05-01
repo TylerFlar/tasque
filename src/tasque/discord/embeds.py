@@ -224,7 +224,7 @@ def _bucket_id_of_branch(produces: dict[str, Any]) -> str | None:
     return None
 
 
-def _build_fan_out_rollup(state: dict[str, Any] | None) -> str | None:
+def build_fan_out_rollup(state: dict[str, Any] | None) -> str | None:
     """Summarize the latest top-level step with fan-out children.
 
     Returns a short multi-line string (outcome → bucket list) when a
@@ -342,7 +342,7 @@ def build_chain_terminal_embed(
     # the rollup makes silent failures (e.g. 8/8 dispatch legs returning
     # ``no_trades`` when prior steps had real trades) immediately
     # visible.
-    rollup = _build_fan_out_rollup(state)
+    rollup = build_fan_out_rollup(state)
     if rollup:
         description = description + "\n\n" + rollup if description else rollup
         description = _truncate(description, EMBED_DESC_LIMIT)

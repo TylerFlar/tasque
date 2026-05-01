@@ -12,16 +12,16 @@ def _base_spec(**overrides: object) -> dict[str, object]:
         "chain_name": "demo",
         "bucket": "personal",
         "recurrence": None,
-        "planner_tier": "opus",
+        "planner_tier": "large",
         "plan": [
-            {"id": "a", "kind": "worker", "directive": "do A", "tier": "haiku"},
+            {"id": "a", "kind": "worker", "directive": "do A", "tier": "small"},
             {
                 "id": "b",
                 "kind": "worker",
                 "directive": "do B",
                 "depends_on": ["a"],
                 "consumes": ["a"],
-                "tier": "haiku",
+                "tier": "small",
             },
         ],
     }
@@ -39,7 +39,7 @@ def test_valid_spec_returns_plan_with_defaults_filled() -> None:
     assert plan[0]["depends_on"] == []
     assert plan[0]["consumes"] == []
     assert plan[0]["fan_out_on"] is None
-    assert plan[0]["tier"] == "haiku"
+    assert plan[0]["tier"] == "small"
 
 
 def test_unknown_top_level_key_rejected() -> None:
@@ -75,7 +75,7 @@ def test_vars_rejected_when_not_object() -> None:
 
 def test_unknown_node_key_rejected() -> None:
     spec = _base_spec(plan=[
-        {"id": "a", "kind": "worker", "directive": "x", "tier": "haiku", "typo_field": 1},
+        {"id": "a", "kind": "worker", "directive": "x", "tier": "small", "typo_field": 1},
     ])
     with pytest.raises(SpecError, match="unknown keys"):
         validate_spec(spec)
@@ -89,14 +89,14 @@ def test_invalid_kind_rejected() -> None:
 
 def test_consumes_must_be_subset_of_depends_on() -> None:
     spec = _base_spec(plan=[
-        {"id": "a", "kind": "worker", "directive": "x", "tier": "haiku"},
+        {"id": "a", "kind": "worker", "directive": "x", "tier": "small"},
         {
             "id": "b",
             "kind": "worker",
             "directive": "y",
             "depends_on": ["a"],
             "consumes": ["a", "ghost"],
-            "tier": "haiku",
+            "tier": "small",
         },
     ])
     with pytest.raises(SpecError, match="consumes"):
@@ -105,7 +105,7 @@ def test_consumes_must_be_subset_of_depends_on() -> None:
 
 def test_fan_out_on_only_allowed_on_workers() -> None:
     spec = _base_spec(plan=[
-        {"id": "a", "kind": "worker", "directive": "x", "tier": "haiku"},
+        {"id": "a", "kind": "worker", "directive": "x", "tier": "small"},
         {
             "id": "b",
             "kind": "approval",
@@ -121,8 +121,8 @@ def test_fan_out_on_only_allowed_on_workers() -> None:
 
 def test_dependency_cycle_detected() -> None:
     spec = _base_spec(plan=[
-        {"id": "a", "kind": "worker", "directive": "x", "depends_on": ["b"], "tier": "haiku"},
-        {"id": "b", "kind": "worker", "directive": "y", "depends_on": ["a"], "tier": "haiku"},
+        {"id": "a", "kind": "worker", "directive": "x", "depends_on": ["b"], "tier": "small"},
+        {"id": "b", "kind": "worker", "directive": "y", "depends_on": ["a"], "tier": "small"},
     ])
     with pytest.raises(SpecError, match="cycle"):
         validate_spec(spec)
@@ -130,7 +130,7 @@ def test_dependency_cycle_detected() -> None:
 
 def test_unknown_dep_id_rejected() -> None:
     spec = _base_spec(plan=[
-        {"id": "a", "kind": "worker", "directive": "x", "depends_on": ["nope"], "tier": "haiku"},
+        {"id": "a", "kind": "worker", "directive": "x", "depends_on": ["nope"], "tier": "small"},
     ])
     with pytest.raises(SpecError, match="unknown id"):
         validate_spec(spec)
@@ -138,8 +138,8 @@ def test_unknown_dep_id_rejected() -> None:
 
 def test_duplicate_step_ids_rejected() -> None:
     spec = _base_spec(plan=[
-        {"id": "a", "kind": "worker", "directive": "x", "tier": "haiku"},
-        {"id": "a", "kind": "worker", "directive": "y", "tier": "haiku"},
+        {"id": "a", "kind": "worker", "directive": "x", "tier": "small"},
+        {"id": "a", "kind": "worker", "directive": "y", "tier": "small"},
     ])
     with pytest.raises(SpecError, match="duplicate"):
         validate_spec(spec)
@@ -158,7 +158,7 @@ def test_alias_dow_recurrence_accepted() -> None:
 
 
 def test_missing_directive_rejected() -> None:
-    spec = _base_spec(plan=[{"id": "a", "kind": "worker", "tier": "haiku"}])
+    spec = _base_spec(plan=[{"id": "a", "kind": "worker", "tier": "small"}])
     with pytest.raises(SpecError, match="directive"):
         validate_spec(spec)
 
@@ -212,7 +212,7 @@ def test_worker_step_invalid_tier_rejected() -> None:
 
 def test_fan_out_concurrency_defaults_to_none_when_omitted() -> None:
     spec = _base_spec(plan=[
-        {"id": "a", "kind": "worker", "directive": "x", "tier": "haiku"},
+        {"id": "a", "kind": "worker", "directive": "x", "tier": "small"},
         {
             "id": "b",
             "kind": "worker",
@@ -220,7 +220,7 @@ def test_fan_out_concurrency_defaults_to_none_when_omitted() -> None:
             "depends_on": ["a"],
             "consumes": ["a"],
             "fan_out_on": "items",
-            "tier": "haiku",
+            "tier": "small",
         },
     ])
     plan = validate_spec(spec)
@@ -230,7 +230,7 @@ def test_fan_out_concurrency_defaults_to_none_when_omitted() -> None:
 
 def test_fan_out_concurrency_accepts_positive_int() -> None:
     spec = _base_spec(plan=[
-        {"id": "a", "kind": "worker", "directive": "x", "tier": "haiku"},
+        {"id": "a", "kind": "worker", "directive": "x", "tier": "small"},
         {
             "id": "b",
             "kind": "worker",
@@ -239,7 +239,7 @@ def test_fan_out_concurrency_accepts_positive_int() -> None:
             "consumes": ["a"],
             "fan_out_on": "items",
             "fan_out_concurrency": 1,
-            "tier": "haiku",
+            "tier": "small",
         },
     ])
     plan = validate_spec(spec)
@@ -249,7 +249,7 @@ def test_fan_out_concurrency_accepts_positive_int() -> None:
 
 def test_fan_out_concurrency_zero_rejected() -> None:
     spec = _base_spec(plan=[
-        {"id": "a", "kind": "worker", "directive": "x", "tier": "haiku"},
+        {"id": "a", "kind": "worker", "directive": "x", "tier": "small"},
         {
             "id": "b",
             "kind": "worker",
@@ -258,7 +258,7 @@ def test_fan_out_concurrency_zero_rejected() -> None:
             "consumes": ["a"],
             "fan_out_on": "items",
             "fan_out_concurrency": 0,
-            "tier": "haiku",
+            "tier": "small",
         },
     ])
     with pytest.raises(SpecError, match="fan_out_concurrency"):
@@ -269,7 +269,7 @@ def test_fan_out_concurrency_bool_rejected() -> None:
     """``True`` is an int subclass; the validator must not silently accept
     it as concurrency=1."""
     spec = _base_spec(plan=[
-        {"id": "a", "kind": "worker", "directive": "x", "tier": "haiku"},
+        {"id": "a", "kind": "worker", "directive": "x", "tier": "small"},
         {
             "id": "b",
             "kind": "worker",
@@ -278,7 +278,7 @@ def test_fan_out_concurrency_bool_rejected() -> None:
             "consumes": ["a"],
             "fan_out_on": "items",
             "fan_out_concurrency": True,
-            "tier": "haiku",
+            "tier": "small",
         },
     ])
     with pytest.raises(SpecError, match="fan_out_concurrency"):
@@ -287,7 +287,7 @@ def test_fan_out_concurrency_bool_rejected() -> None:
 
 def test_fan_out_concurrency_without_fan_out_on_rejected() -> None:
     spec = _base_spec(plan=[
-        {"id": "a", "kind": "worker", "directive": "x", "tier": "haiku"},
+        {"id": "a", "kind": "worker", "directive": "x", "tier": "small"},
         {
             "id": "b",
             "kind": "worker",
@@ -295,7 +295,7 @@ def test_fan_out_concurrency_without_fan_out_on_rejected() -> None:
             "depends_on": ["a"],
             "consumes": ["a"],
             "fan_out_concurrency": 1,
-            "tier": "haiku",
+            "tier": "small",
         },
     ])
     with pytest.raises(SpecError, match="fan_out_concurrency"):
@@ -304,14 +304,14 @@ def test_fan_out_concurrency_without_fan_out_on_rejected() -> None:
 
 def test_approval_step_with_tier_rejected() -> None:
     spec = _base_spec(plan=[
-        {"id": "a", "kind": "worker", "directive": "x", "tier": "haiku"},
+        {"id": "a", "kind": "worker", "directive": "x", "tier": "small"},
         {
             "id": "b",
             "kind": "approval",
             "directive": "approve",
             "depends_on": ["a"],
             "consumes": ["a"],
-            "tier": "haiku",
+            "tier": "small",
         },
     ])
     with pytest.raises(SpecError, match="tier"):
@@ -320,7 +320,7 @@ def test_approval_step_with_tier_rejected() -> None:
 
 def test_approval_step_without_tier_accepted() -> None:
     spec = _base_spec(plan=[
-        {"id": "a", "kind": "worker", "directive": "x", "tier": "haiku"},
+        {"id": "a", "kind": "worker", "directive": "x", "tier": "small"},
         {
             "id": "b",
             "kind": "approval",
@@ -348,7 +348,7 @@ def test_produces_schema_required_keys_parsed() -> None:
             "id": "a",
             "kind": "worker",
             "directive": "x",
-            "tier": "haiku",
+            "tier": "small",
             "produces_schema": {"required": ["foo", "bar"]},
         },
     ])
@@ -364,7 +364,7 @@ def test_produces_schema_list_items_parsed() -> None:
             "id": "a",
             "kind": "worker",
             "directive": "x",
-            "tier": "haiku",
+            "tier": "small",
             "produces_schema": {
                 "required": ["branches"],
                 "list_items": {
@@ -391,7 +391,7 @@ def test_produces_schema_unknown_top_level_key_rejected() -> None:
             "id": "a",
             "kind": "worker",
             "directive": "x",
-            "tier": "haiku",
+            "tier": "small",
             "produces_schema": {"properties": {"foo": "str"}},
         },
     ])
@@ -401,7 +401,7 @@ def test_produces_schema_unknown_top_level_key_rejected() -> None:
 
 def test_produces_schema_on_approval_step_rejected() -> None:
     spec = _base_spec(plan=[
-        {"id": "a", "kind": "worker", "directive": "x", "tier": "haiku"},
+        {"id": "a", "kind": "worker", "directive": "x", "tier": "small"},
         {
             "id": "b",
             "kind": "approval",

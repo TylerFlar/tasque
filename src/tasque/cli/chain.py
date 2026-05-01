@@ -125,7 +125,12 @@ def cmd_queue(
             raise typer.Exit(code=2)
         runtime_vars = parsed_vars
 
-    chain_id = launch_chain_run(spec, template_id=template_id, vars=runtime_vars)
+    chain_id = launch_chain_run(
+        spec,
+        template_id=template_id,
+        vars=runtime_vars,
+        wait=False,
+    )
     typer.echo(json.dumps({"chain_id": chain_id}))
 
 

@@ -1,37 +1,33 @@
 """Chain launch + cron polling + restart-recovery.
 
-Four entry points:
+Main entry points:
 
-* :func:`launch_chain_run` — seed a fresh ChainRun row + initial
-  checkpoint state and synchronously invoke the graph until it
-  terminates or interrupts (the supervisor handles serial dispatch).
+* :func:`launch_chain_run` — seed a fresh ChainRun row plus the
+  serialized initial state the daemon runner needs. ``wait=False`` is a
+  durable enqueue only; it never starts a graph in the caller process.
 * :func:`fire_due_chain_templates` — APScheduler poll callback. Finds
-  enabled templates whose cron is due, validates them, fires each.
+  enabled templates whose cron is due, validates them, enqueues each.
+* :func:`claim_and_run_ready_chains` — daemon-owned execution. Claims
+  one runnable ChainRun with a DB lease, invokes LangGraph, and extends
+  the lease while work is active.
 * :func:`resume_interrupted_chains` — startup hook. Re-invokes the
-  graph for every ChainRun left in ``running`` so an unclean shutdown
-  doesn't leave a chain wedged. Also resets ``failed`` plan nodes back
-  to ``pending`` so transient errors get retried on boot.
-* :func:`resume_stale_chains` — daemon tick. Re-invokes the graph for
-  any ``running`` ChainRun whose latest checkpoint is older than
-  ``threshold_seconds``. Picks up chains whose runner thread died with
-  the calling process (e.g. an MCP-fired chain whose ``claude --print``
-  subprocess exited mid-invoke) without waiting for a daemon restart.
-  Unlike :func:`resume_interrupted_chains`, this does NOT reset failed
-  steps — running periodically with that behavior would erase legitimate
-  failure state on every tick.
+  lease runner with failed checkpoint steps reset to ``pending`` so
+  transient errors get retried on boot.
+* :func:`resume_stale_chains` — compatibility wrapper for old call
+  sites. Staleness no longer drives dispatch.
 """
 
 from __future__ import annotations
 
 import json
 import threading
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import uuid4
 
 import structlog
 from langchain_core.runnables import RunnableConfig
-from sqlalchemy import select
+from sqlalchemy import or_, select, update
 
 from tasque.chains.checkpointer import get_chain_checkpointer
 from tasque.chains.graph import get_compiled_chain_graph
@@ -50,26 +46,103 @@ log = structlog.get_logger(__name__)
 
 
 # In-process registry of chain ids whose graph.invoke is currently
-# running on this process. ``resume_stale_chains`` consults this to
-# avoid double-dispatching a chain whose runner thread is alive in
-# this process but happens to be sitting inside a slow LLM turn (no
-# checkpoint update for the duration of the call). Cross-process
-# invocations whose process died are NOT in this set, so they still
-# get resumed correctly. The set is in-memory only — a daemon crash
-# clears it, which is the right semantic: any chain that was active
-# before the crash is no longer active after.
+# running on this process. The DB lease is the cross-process authority;
+# this local set is just cheap introspection/test support while the
+# heartbeat thread refreshes lease/heartbeat fields for active work.
 _active_chain_invokes: set[str] = set()
+_active_chain_heartbeats: dict[str, tuple[threading.Event, threading.Thread]] = {}
 _active_chain_invokes_lock = threading.Lock()
+DEFAULT_CHAIN_HEARTBEAT_INTERVAL_SECONDS = 30.0
+DEFAULT_CHAIN_LEASE_SECONDS = 300.0
 
 
-def _mark_invoke_active(chain_id: str) -> None:
+def _future_iso(seconds: float) -> str:
+    return (datetime.now(UTC) + timedelta(seconds=seconds)).strftime(
+        "%Y-%m-%dT%H:%M:%S.%fZ"
+    )
+
+
+def _bump_chain_heartbeat(
+    chain_id: str,
+    iso: str | None = None,
+    *,
+    owner_id: str | None = None,
+    lease_seconds: float = DEFAULT_CHAIN_LEASE_SECONDS,
+) -> bool:
+    """Persist a liveness mark for a currently-running graph invoke."""
+    now_iso = iso or utc_now_iso()
+    with get_session() as sess:
+        stmt = select(ChainRun).where(ChainRun.chain_id == chain_id)
+        if owner_id is not None:
+            stmt = stmt.where(ChainRun.lease_owner == owner_id)
+        row = sess.execute(stmt).scalars().first()
+        if row is None:
+            return False
+        row.last_heartbeat = now_iso
+        if owner_id is not None:
+            row.lease_expires_at = _future_iso(lease_seconds)
+        row.updated_at = now_iso
+        return True
+
+
+def _pump_chain_heartbeat(
+    chain_id: str,
+    stop: threading.Event,
+    interval_seconds: float = DEFAULT_CHAIN_HEARTBEAT_INTERVAL_SECONDS,
+    owner_id: str | None = None,
+    lease_seconds: float = DEFAULT_CHAIN_LEASE_SECONDS,
+) -> None:
+    """Refresh ``ChainRun.last_heartbeat`` until the active invoke ends."""
+    while not stop.is_set():
+        try:
+            if not _bump_chain_heartbeat(
+                chain_id,
+                owner_id=owner_id,
+                lease_seconds=lease_seconds,
+            ):
+                return
+        except Exception:
+            log.exception(
+                "chains.scheduler.heartbeat_failed",
+                chain_id=chain_id[:8],
+            )
+        if stop.wait(timeout=interval_seconds):
+            return
+
+
+def _mark_invoke_active(
+    chain_id: str,
+    *,
+    owner_id: str | None = None,
+    lease_seconds: float = DEFAULT_CHAIN_LEASE_SECONDS,
+) -> None:
+    heartbeat: tuple[threading.Event, threading.Thread] | None = None
     with _active_chain_invokes_lock:
         _active_chain_invokes.add(chain_id)
+        if chain_id not in _active_chain_heartbeats:
+            stop = threading.Event()
+            thread = threading.Thread(
+                target=_pump_chain_heartbeat,
+                args=(chain_id, stop),
+                kwargs={"owner_id": owner_id, "lease_seconds": lease_seconds},
+                name=f"tasque-chain-heartbeat-{chain_id[:8]}",
+                daemon=True,
+            )
+            heartbeat = (stop, thread)
+            _active_chain_heartbeats[chain_id] = heartbeat
+    if heartbeat is not None:
+        heartbeat[1].start()
 
 
 def _mark_invoke_inactive(chain_id: str) -> None:
+    heartbeat: tuple[threading.Event, threading.Thread] | None = None
     with _active_chain_invokes_lock:
         _active_chain_invokes.discard(chain_id)
+        heartbeat = _active_chain_heartbeats.pop(chain_id, None)
+    if heartbeat is not None:
+        stop, thread = heartbeat
+        stop.set()
+        thread.join(timeout=2.0)
 
 
 def _is_invoke_active(chain_id: str) -> bool:
@@ -130,6 +203,8 @@ def _set_run_terminal(chain_id: str, *, status: str) -> None:
             return
         row.status = status
         row.ended_at = utc_now_iso()
+        row.lease_owner = None
+        row.lease_expires_at = None
         row.updated_at = utc_now_iso()
         log.info(
             "chains.scheduler.terminal",
@@ -139,27 +214,172 @@ def _set_run_terminal(chain_id: str, *, status: str) -> None:
         )
 
 
-def _invoke_chain_graph(chain_id: str, initial: dict[str, Any]) -> None:
+def _release_chain_lease(chain_id: str, owner_id: str) -> None:
+    now_iso = utc_now_iso()
+    with get_session() as sess:
+        stmt = select(ChainRun).where(
+            ChainRun.chain_id == chain_id,
+            ChainRun.lease_owner == owner_id,
+        )
+        row = sess.execute(stmt).scalars().first()
+        if row is None:
+            return
+        row.lease_owner = None
+        row.lease_expires_at = None
+        row.updated_at = now_iso
+
+
+def _set_run_awaiting_approval(chain_id: str) -> None:
+    now_iso = utc_now_iso()
+    with get_session() as sess:
+        stmt = select(ChainRun).where(ChainRun.chain_id == chain_id)
+        row = sess.execute(stmt).scalars().first()
+        if row is None or row.status != "running":
+            return
+        row.status = "awaiting_approval"
+        row.lease_owner = None
+        row.lease_expires_at = None
+        row.updated_at = now_iso
+
+
+def _state_has_waiting_approval(state: dict[str, Any] | None) -> bool:
+    if state is None:
+        return False
+    plan: list[PlanNode] = list(state.get("plan") or [])
+    return any(
+        n.get("kind") == "approval"
+        and n.get("status") in ("running", "awaiting_user")
+        for n in plan
+    )
+
+
+def _checkpoint_state(chain_id: str) -> dict[str, Any] | None:
+    saver = get_chain_checkpointer()
+    snap = saver.get_tuple(_thread_config(chain_id))
+    if snap is None:
+        return None
+    return snap.checkpoint.get("channel_values", {})
+
+
+def _load_initial_state(row: ChainRun) -> dict[str, Any] | None:
+    if not row.initial_state_json:
+        return None
+    try:
+        raw = json.loads(row.initial_state_json)
+    except json.JSONDecodeError:
+        return None
+    return cast(dict[str, Any], raw) if isinstance(raw, dict) else None
+
+
+def _claim_next_runnable_chain(
+    *,
+    owner_id: str,
+    lease_seconds: float = DEFAULT_CHAIN_LEASE_SECONDS,
+    now: datetime | None = None,
+) -> ChainRun | None:
+    """Atomically claim one unowned or expired running chain for this daemon."""
+    reference = now if now is not None else datetime.now(UTC)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=UTC)
+    now_iso = reference.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    lease_expires_at = (
+        reference.astimezone(UTC) + timedelta(seconds=lease_seconds)
+    ).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+    with get_session() as sess:
+        candidate_stmt = (
+            select(ChainRun)
+            .where(ChainRun.status == "running")
+            .where(
+                or_(
+                    ChainRun.lease_owner.is_(None),
+                    ChainRun.lease_expires_at.is_(None),
+                    ChainRun.lease_expires_at <= now_iso,
+                )
+            )
+            .order_by(ChainRun.created_at.asc())
+            .limit(10)
+        )
+        candidates = list(sess.execute(candidate_stmt).scalars().all())
+        for candidate in candidates:
+            if _is_invoke_active(candidate.chain_id):
+                continue
+            state = _checkpoint_state(candidate.chain_id)
+            if _state_has_waiting_approval(state):
+                candidate.status = "awaiting_approval"
+                candidate.lease_owner = None
+                candidate.lease_expires_at = None
+                candidate.updated_at = now_iso
+                continue
+
+            claim_stmt = (
+                update(ChainRun)
+                .where(ChainRun.id == candidate.id)
+                .where(ChainRun.status == "running")
+                .where(
+                    or_(
+                        ChainRun.lease_owner.is_(None),
+                        ChainRun.lease_expires_at.is_(None),
+                        ChainRun.lease_expires_at <= now_iso,
+                    )
+                )
+                .values(
+                    lease_owner=owner_id,
+                    lease_expires_at=lease_expires_at,
+                    last_heartbeat=now_iso,
+                    updated_at=now_iso,
+                )
+            )
+            sess.execute(claim_stmt)
+            row = sess.execute(
+                select(ChainRun).where(
+                    ChainRun.id == candidate.id,
+                    ChainRun.lease_owner == owner_id,
+                )
+            ).scalars().first()
+            if row is None:
+                continue
+            sess.expunge(row)
+            return row
+    return None
+
+
+def _invoke_chain_graph(
+    chain_id: str,
+    initial: dict[str, Any] | None,
+    *,
+    owner_id: str | None = None,
+    lease_seconds: float = DEFAULT_CHAIN_LEASE_SECONDS,
+    raise_on_error: bool = False,
+) -> None:
     """Run ``graph.invoke`` for ``chain_id`` and finalize status.
 
-    Factored out so both the synchronous (``wait=True``) and
-    fire-and-forget (``wait=False``) paths share one body. Runtime
-    failures are logged and the ChainRun row is flipped to ``failed``
-    so the daemon's chain-status watcher posts a terminal embed.
+    Runtime failures are logged and the ChainRun row is flipped to
+    ``failed`` so the daemon's chain-status watcher posts a terminal
+    embed.
     """
     graph = get_compiled_chain_graph()
     cfg = _thread_config(chain_id)
-    _mark_invoke_active(chain_id)
+    _mark_invoke_active(
+        chain_id,
+        owner_id=owner_id,
+        lease_seconds=lease_seconds,
+    )
     try:
         try:
-            graph.invoke(initial, cfg)
+            graph.invoke(cast(Any, initial), cfg)
         except Exception:
             log.exception(
                 "chains.scheduler.launch_invoke_failed", chain_id=chain_id
             )
             _set_run_terminal(chain_id, status="failed")
+            if raise_on_error:
+                raise
             return
         maybe_finalize_status(chain_id)
+        state = _checkpoint_state(chain_id)
+        if _state_has_waiting_approval(state):
+            _set_run_awaiting_approval(chain_id)
     finally:
         _mark_invoke_inactive(chain_id)
 
@@ -174,20 +394,12 @@ def launch_chain_run(
 ) -> str:
     """Start a new chain. Returns the new ``chain_id``.
 
-    Validates the spec, creates a ``ChainRun`` row, seeds initial state
-    in the checkpointer, then invokes the graph. The default
-    ``wait=True`` runs the graph synchronously and returns once it
-    terminates or hits an interrupt — used by the CLI and the cron
-    firing path so callers see the run through.
-
-    Pass ``wait=False`` for fire-and-forget semantics: the graph is
-    invoked on a background daemon thread, the ``chain_id`` is returned
-    in milliseconds. Used by the MCP so a coach reply that fires a
-    chain doesn't block on its completion. Caveat: the background
-    thread runs in the *caller's* process — if that process exits
-    before the chain finishes, the chain is left in ``running`` status
-    and the daemon's ``resume_interrupted_chains`` startup hook picks
-    it up on next boot.
+    Validates the spec, creates a ``ChainRun`` row, and persists the
+    initial state needed by the daemon-owned chain runner. The default
+    ``wait=True`` still runs the graph synchronously for CLI/tests. Pass
+    ``wait=False`` for durable enqueue semantics: the caller gets a
+    ``chain_id`` immediately and the long-running daemon claims and
+    invokes the chain via a DB lease.
 
     ``vars`` is an operator-supplied override that is merged over the
     spec's static ``vars`` (caller wins on key collision). The merged
@@ -207,6 +419,15 @@ def launch_chain_run(
 
     chain_id = _new_chain_id()
     started = utc_now_iso()
+    initial = _initial_state(
+        chain_id=chain_id,
+        chain_name=chain_name,
+        bucket=bucket,
+        plan=plan,
+        thread_id=thread_id,
+        planner_tier=planner_tier,
+        vars=merged_vars,
+    )
     with get_session() as sess:
         run = ChainRun(
             chain_id=chain_id,
@@ -216,6 +437,8 @@ def launch_chain_run(
             thread_id=thread_id,
             status="running",
             started_at=started,
+            initial_state_json=json.dumps(initial, default=str),
+            last_heartbeat=started,
         )
         sess.add(run)
         sess.flush()
@@ -229,47 +452,111 @@ def launch_chain_run(
         wait=wait,
     )
 
-    initial = _initial_state(
-        chain_id=chain_id,
-        chain_name=chain_name,
-        bucket=bucket,
-        plan=plan,
-        thread_id=thread_id,
-        planner_tier=planner_tier,
-        vars=merged_vars,
-    )
-
     if wait:
         # Original synchronous path: run the graph here and let the
         # caller see it through.
-        graph = get_compiled_chain_graph()
-        cfg = _thread_config(chain_id)
-        _mark_invoke_active(chain_id)
-        try:
-            try:
-                graph.invoke(initial, cfg)
-            except Exception:
-                log.exception(
-                    "chains.scheduler.launch_invoke_failed", chain_id=chain_id
-                )
-                _set_run_terminal(chain_id, status="failed")
-                raise
-            maybe_finalize_status(chain_id)
-        finally:
-            _mark_invoke_inactive(chain_id)
+        _invoke_chain_graph(chain_id, initial, raise_on_error=True)
     else:
-        # Fire-and-forget: spawn a daemon thread to run the graph and
-        # return the chain_id immediately. The caller (typically the
-        # MCP) can include chain_id in its response so the user knows
-        # which run to watch.
-        threading.Thread(
-            target=_invoke_chain_graph,
-            args=(chain_id, initial),
-            name=f"tasque-chain-invoke-{chain_id[:8]}",
-            daemon=True,
-        ).start()
+        log.info(
+            "chains.scheduler.enqueued",
+            chain_id=chain_id[:8],
+            chain_name=chain_name,
+        )
 
     return chain_id
+
+
+def _invoke_claimed_chain(
+    row: ChainRun,
+    *,
+    owner_id: str,
+    lease_seconds: float,
+    reset_failed: bool,
+) -> None:
+    state = _checkpoint_state(row.chain_id)
+    if _state_has_waiting_approval(state):
+        _set_run_awaiting_approval(row.chain_id)
+        return
+
+    initial: dict[str, Any] | None = None
+    if state is None:
+        initial = _load_initial_state(row)
+        if initial is None:
+            log.error(
+                "chains.scheduler.missing_initial_state",
+                chain_id=row.chain_id[:8],
+                chain_name=row.chain_name,
+            )
+            _set_run_terminal(row.chain_id, status="failed")
+            return
+    elif reset_failed:
+        reset_ids = _reset_failed_steps_for_resume(row.chain_id)
+        if reset_ids:
+            log.info(
+                "chains.scheduler.resume_retrying_failed",
+                chain_id=row.chain_id[:8],
+                chain_name=row.chain_name,
+                steps=reset_ids,
+            )
+
+    _invoke_chain_graph(
+        row.chain_id,
+        initial,
+        owner_id=owner_id,
+        lease_seconds=lease_seconds,
+    )
+
+
+def claim_and_run_ready_chains(
+    *,
+    owner_id: str | None = None,
+    max_runs: int = 1,
+    lease_seconds: float = DEFAULT_CHAIN_LEASE_SECONDS,
+    reset_failed: bool = False,
+) -> list[str]:
+    """Claim and invoke runnable chains using a durable DB lease.
+
+    This is the daemon-owned execution path. Enqueuers create
+    ``running`` rows with ``initial_state_json`` and return; this runner
+    is the only periodic component that invokes those rows. Leases
+    replace checkpoint-age staleness guesses: a row is runnable only
+    when no live owner holds it, or when the owner's lease has expired.
+    """
+    if max_runs <= 0:
+        return []
+    actual_owner = owner_id or f"daemon-{uuid4().hex[:12]}"
+    ran: list[str] = []
+    for _ in range(max_runs):
+        row = _claim_next_runnable_chain(
+            owner_id=actual_owner,
+            lease_seconds=lease_seconds,
+        )
+        if row is None:
+            break
+        log.info(
+            "chains.scheduler.claimed",
+            chain_id=row.chain_id[:8],
+            chain_name=row.chain_name,
+            owner_id=actual_owner,
+        )
+        try:
+            _invoke_claimed_chain(
+                row,
+                owner_id=actual_owner,
+                lease_seconds=lease_seconds,
+                reset_failed=reset_failed,
+            )
+        except Exception:
+            log.exception(
+                "chains.scheduler.claimed_invoke_failed",
+                chain_id=row.chain_id,
+                owner_id=actual_owner,
+            )
+            _set_run_terminal(row.chain_id, status="failed")
+        finally:
+            _release_chain_lease(row.chain_id, actual_owner)
+        ran.append(row.chain_id)
+    return ran
 
 
 def maybe_finalize_status(chain_id: str) -> None:
@@ -354,7 +641,7 @@ def fire_due_chain_templates(*, now: datetime | None = None) -> list[str]:
             recurrence=template.recurrence,
         )
         try:
-            chain_id = launch_chain_run(spec, template_id=template.id)
+            chain_id = launch_chain_run(spec, template_id=template.id, wait=False)
         except Exception:
             log.exception(
                 "chains.scheduler.launch_failed",
@@ -440,7 +727,7 @@ def _reset_failed_steps_for_resume(chain_id: str) -> list[str]:
 
 
 def resume_interrupted_chains() -> list[str]:
-    """Re-invoke the graph for every ``running`` ChainRun. Startup hook.
+    """Boot-recovery wrapper around the lease runner.
 
     Before invoking, any ``failed`` plan nodes are flipped back to
     ``pending`` and their failures cleared, so a bot restart retries
@@ -451,58 +738,51 @@ def resume_interrupted_chains() -> list[str]:
     but downstream consumers like a gather step stay ``pending`` and the
     ChainRun row never finalises.
 
-    Rows that are already in awaiting_user state simply pause again at
-    the interrupt — that's fine; the resume comes via the reply runtime.
+    Rows are claimed through the same durable lease path as normal
+    daemon execution.
     """
-    resumed: list[str] = []
-    with get_session() as sess:
-        stmt = select(ChainRun).where(ChainRun.status == "running")
-        rows = list(sess.execute(stmt).scalars().all())
-        for r in rows:
-            sess.expunge(r)
-
-    graph = get_compiled_chain_graph()
-    for r in rows:
-        cfg = _thread_config(r.chain_id)
-        _mark_invoke_active(r.chain_id)
-        try:
-            try:
-                reset_ids = _reset_failed_steps_for_resume(r.chain_id)
-                if reset_ids:
-                    log.info(
-                        "chains.scheduler.resume_retrying_failed",
-                        chain_id=r.chain_id[:8],
-                        chain_name=r.chain_name,
-                        steps=reset_ids,
-                    )
-                graph.invoke(cast(Any, None), cfg)
-            except Exception:
-                log.exception(
-                    "chains.scheduler.resume_failed", chain_id=r.chain_id
-                )
-                continue
-            maybe_finalize_status(r.chain_id)
-        finally:
-            _mark_invoke_inactive(r.chain_id)
-        resumed.append(r.chain_id)
-    return resumed
+    return claim_and_run_ready_chains(
+        owner_id=f"boot-{uuid4().hex[:12]}",
+        max_runs=100,
+        reset_failed=True,
+    )
 
 
-# Staleness threshold for ``resume_stale_chains``. The previous 30s value
-# was shorter than a normal opus dispatch turn (60-90s of LLM time during
-# which the chain's checkpoint isn't updated) and caused the resume tick
-# to re-invoke the graph mid-step, double-dispatching workers and
-# producing duplicate proposal rows. 300s is comfortably longer than any
-# single LLM turn (the proxy's stall watchdog kills the subprocess after
-# 5 min of stdout silence anyway, so a wedged in-process worker can't
-# survive longer than this without surfacing as an exception). Combined
-# with the ``_active_chain_invokes`` registry, which excludes chains
-# whose runner thread is alive in this process from staleness-based
-# resume entirely, this eliminates the mid-turn double-dispatch race.
+# Kept only for compatibility with callers that still pass a stale-resume
+# threshold. Dispatch is lease-owned now, not checkpoint-age-owned.
 DEFAULT_STALE_RESUME_THRESHOLD_SECONDS = 300.0
 
 
-def _checkpoint_age_seconds(chain_id: str, *, now: datetime | None = None) -> float | None:
+def _parse_utc_iso(raw: Any) -> datetime | None:
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        if raw.endswith("Z"):
+            ts = datetime.strptime(raw, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=UTC)
+        else:
+            ts = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=UTC)
+    return ts.astimezone(UTC)
+
+
+def _age_seconds(raw_iso: Any, *, now: datetime | None = None) -> float | None:
+    ts = _parse_utc_iso(raw_iso)
+    if ts is None:
+        return None
+    reference = now if now is not None else datetime.now(UTC)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=UTC)
+    return (reference.astimezone(UTC) - ts).total_seconds()
+
+
+def _checkpoint_age_seconds(  # pyright: ignore[reportUnusedFunction]
+    chain_id: str,
+    *,
+    now: datetime | None = None,
+) -> float | None:
     """Return seconds since the latest checkpoint write for ``chain_id``.
 
     ``None`` means there is no checkpoint at all (the chain row exists
@@ -517,14 +797,7 @@ def _checkpoint_age_seconds(chain_id: str, *, now: datetime | None = None) -> fl
     raw_ts = snap.checkpoint.get("ts")
     if not raw_ts:
         return None
-    try:
-        ts = datetime.fromisoformat(raw_ts)
-    except ValueError:
-        return None
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=UTC)
-    reference = now if now is not None else datetime.now(UTC)
-    return (reference - ts).total_seconds()
+    return _age_seconds(raw_ts, now=now)
 
 
 def resume_stale_chains(
@@ -532,82 +805,21 @@ def resume_stale_chains(
     threshold_seconds: float = DEFAULT_STALE_RESUME_THRESHOLD_SECONDS,
     now: datetime | None = None,
 ) -> list[str]:
-    """Re-invoke the graph for ``running`` chains whose checkpoint is stale.
+    """Compatibility wrapper for the old stale-resume entry point.
 
-    ``threshold_seconds`` is the minimum checkpoint age (vs. ``now``)
-    before we step in. The daemon's tick uses this to leave actively
-    progressing chains alone — a chain currently writing checkpoints
-    has a fresh ``ts`` and is skipped.
-
-    Two layers of guard against false-positive resumes:
-
-    1. ``_active_chain_invokes`` — chains currently being run by this
-       process are skipped outright, even if their checkpoint looks
-       stale (a long LLM turn keeps the runner thread alive but doesn't
-       update the checkpoint).
-    2. ``threshold_seconds`` — for chains with no in-process owner, the
-       checkpoint must be older than the threshold. Defaults to 5 min
-       (longer than any single LLM turn the proxy permits).
-
-    Recovery path for chains whose runner thread died with the calling
-    process. Common case: the MCP server inside ``claude --print`` calls
-    ``launch_chain_run(wait=False)`` which spawns a daemon thread; that
-    thread is killed when ``claude --print`` finishes the user's turn,
-    leaving the chain in ``running`` with a stale checkpoint. The
-    periodic tick re-invokes the graph so the chain progresses without
-    needing a daemon restart.
-
-    Returns the list of resumed ``chain_id`` values. Failures during
-    invoke are logged but do not abort the loop — one bad chain doesn't
-    stop the others from progressing.
+    Staleness is no longer used to decide whether a chain is safe to
+    invoke. The daemon runner claims rows by durable lease instead.
+    ``threshold_seconds`` and ``now`` are accepted so older call sites
+    keep working, but they no longer affect dispatch.
     """
-    with get_session() as sess:
-        stmt = select(ChainRun).where(ChainRun.status == "running")
-        rows = list(sess.execute(stmt).scalars().all())
-        for r in rows:
-            sess.expunge(r)
-
-    graph = get_compiled_chain_graph()
-    resumed: list[str] = []
-    for r in rows:
-        # Skip chains whose runner thread is alive in this process — a
-        # stale checkpoint here just means the worker is mid-turn, not
-        # that the chain is wedged. Re-invoking would double-dispatch.
-        if _is_invoke_active(r.chain_id):
-            continue
-        age = _checkpoint_age_seconds(r.chain_id, now=now)
-        if age is None:
-            # No checkpoint at all: the row exists but the calling
-            # process died before the graph wrote even one checkpoint.
-            # Treat as fully stale so we re-seed and run.
-            age = float("inf")
-        if age < threshold_seconds:
-            continue
-        cfg = _thread_config(r.chain_id)
-        log.info(
-            "chains.scheduler.resume_stale_invoking",
-            chain_id=r.chain_id[:8],
-            chain_name=r.chain_name,
-            age_s=round(age, 1) if age != float("inf") else None,
-        )
-        _mark_invoke_active(r.chain_id)
-        try:
-            try:
-                graph.invoke(cast(Any, None), cfg)
-            except Exception:
-                log.exception(
-                    "chains.scheduler.resume_stale_failed", chain_id=r.chain_id
-                )
-                continue
-            maybe_finalize_status(r.chain_id)
-        finally:
-            _mark_invoke_inactive(r.chain_id)
-        resumed.append(r.chain_id)
-    return resumed
+    _ = (threshold_seconds, now)
+    return claim_and_run_ready_chains(max_runs=1, reset_failed=False)
 
 
 __all__ = [
+    "DEFAULT_CHAIN_LEASE_SECONDS",
     "DEFAULT_STALE_RESUME_THRESHOLD_SECONDS",
+    "claim_and_run_ready_chains",
     "fire_due_chain_templates",
     "launch_chain_run",
     "maybe_finalize_status",

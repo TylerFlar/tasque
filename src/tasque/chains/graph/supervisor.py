@@ -137,7 +137,7 @@ def _materialize_fan_out(
        per bucket → ``news_veto`` fans out per ``scan`` branch). It
        eliminates the need for an LLM passthrough aggregator step —
        the LLM-as-data-pipe pattern was load-bearingly fragile (the
-       2026-04-30 trading-scan run had ``aggregate_news_veto`` (haiku)
+       2026-04-30 trading-scan run had ``aggregate_news_veto`` (small)
        hallucinate every branch's ``bucket`` and ``trade_list`` while
        still producing a schema-valid shape, sending fabricated trades
        to dispatch).

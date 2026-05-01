@@ -4,7 +4,7 @@ Three linear nodes:
 
     build_prompt → call_llm → persist_run
 
-The worker is intentionally narrow: assemble a prompt, call the haiku-tier
+The worker is intentionally narrow: assemble a prompt, call the small-tier
 LLM, parse a JSON block of ``{report, summary, produces}``, persist a
 ``Note(durability=durable, source=worker)`` summarising the run.
 
@@ -96,14 +96,15 @@ you perform — queueing a follow-up job, writing a Note, firing a chain,
 sending a Signal — happens through these tools, synchronously, during
 your turn. Pass the bucket from the run context above on each call.
 
-- **Notes**: ``note_create``, ``note_get``, ``note_list``, ``note_search``,
+- **Notes**: ``note_create``, ``note_update``, ``note_supersede``,
+  ``note_get``, ``note_list``, ``note_search``, ``note_search_any``,
   ``note_search_fts``, ``note_archive``.
 - **Queued jobs**: ``job_create(directive, bucket, tier, fire_at,
   recurrence, ...)``, ``job_get``, ``job_update``, ``job_cancel``,
   ``job_list``. One-shot (``recurrence=None``) and recurring
-  (5-field cron, alias DOW). ``tier`` is required: ``"haiku"`` for
-  trivial nudges, ``"sonnet"`` for multi-step tool / scrape /
-  summarize work, ``"opus"`` for agentic planning, code iteration,
+  (5-field cron, alias DOW). ``tier`` is required: ``"small"`` for
+  trivial nudges, ``"medium"`` for multi-step tool / scrape /
+  summarize work, ``"large"`` for agentic planning, code iteration,
   or deep creative generation.
 - **Chain templates**: ``chain_template_create``, ``chain_template_get``,
   ``chain_template_list``, ``chain_template_update``, ``chain_template_delete``.
@@ -114,17 +115,6 @@ your turn. Pass the bucket from the run context above on each call.
 - **Signals**: ``signal_create``, ``signal_list``, ``signal_archive``.
 - **Aims**: ``aim_get``, ``aim_list`` (workers don't typically create
   Aims — that's the strategist's job).
-- **Idle-silence claim**: ``claim_idle_silence(seconds, reason)``.
-  Call this BEFORE any tool you expect to keep stdout silent for >2
-  minutes (model training, large download, long Bash sleep, slow
-  scrape). Tasque's proxy runs a stall watchdog that kills the
-  ``claude --print`` subprocess after ~5 min of stdout silence by
-  default — without this call, a legitimate 30-min training run looks
-  identical to a hang. Honest estimate; over-budget still re-engages
-  the watchdog so genuine hangs past your estimate still get caught.
-  Returns ``{"ok": false}`` when not running under the proxy (e.g.
-  during a unit test) — safe to ignore.
-
 When you make an MCP call, capture any returned ids / structured
 results that downstream chain steps need to see, and surface them in
 your ``produces`` dict. The MCP performed the write; ``produces`` is
@@ -282,7 +272,7 @@ def _call_llm(state: WorkerState) -> dict[str, Any]:
         }
     text = _extract_text(response)
 
-    # Tool-call miss recovery: the haiku tier in particular sometimes
+    # Tool-call miss recovery: the small tier in particular sometimes
     # finishes its turn with prose only and never invokes
     # submit_worker_result, sinking the whole job. Give it one
     # follow-up nudge before the persist node fails the run. The
@@ -454,7 +444,7 @@ def run_worker(
             produces={},
             error=(
                 f"QueuedJob {job.id} has no tier set; refusing to run. "
-                f"Every job must declare its tier (opus / sonnet / haiku) "
+                f"Every job must declare its tier (large / medium / small) "
                 f"at insert time."
             ),
         )

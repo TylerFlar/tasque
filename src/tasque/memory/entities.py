@@ -120,8 +120,8 @@ class QueuedJob(Base):
     chain_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     chain_step_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     timeout_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    # Model tier the worker should run this job at — "opus", "sonnet",
-    # or "haiku". Resolved to a concrete model id at run time via
+    # Model tier the worker should run this job at — "large", "medium",
+    # or "small". Resolved to a concrete model id at run time via
     # ``tasque.llm.factory.get_chat_model_for_tier``. Nullable for
     # forward compatibility with rows written before the column existed;
     # the runner falls back to the worker default when unset.
@@ -209,6 +209,10 @@ class ChainRun(Base):
     thread_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     started_at: Mapped[str] = mapped_column(String(32), nullable=False)
+    initial_state_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    lease_owner: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    lease_expires_at: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    last_heartbeat: Mapped[str | None] = mapped_column(String(32), nullable=True)
     ended_at: Mapped[str | None] = mapped_column(String(32), nullable=True)
     status_message_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # ISO-8601 timestamp set the first time the chain status watcher

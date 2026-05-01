@@ -4,16 +4,17 @@ Two resolution paths:
 
 1. **Agent-kind path** — :func:`get_chat_model` for fixed-role agents
    (coach, strategist) whose tier is hardcoded by their role. Resolution
-   priority: ``TASQUE_MODEL_<KIND>`` → ``TASQUE_MODEL_<TIER>`` → built-in
-   default mapping from agent kind → tier → model id.
+   priority: ``TASQUE_MODEL_<KIND>`` as a tier alias or concrete model →
+   ``TASQUE_MODEL_<TIER>``.
 2. **Tier path** — :func:`get_chat_model_for_tier` for the worker and
    planner, whose tier is chosen per-row (per ``QueuedJob`` and per chain
    plan node / chain spec). Resolution priority:
-   ``TASQUE_MODEL_<TIER>`` → built-in default for the tier.
+   ``TASQUE_MODEL_<TIER>``.
 
 The proxy URL defaults to ``http://localhost:3456/v1`` and is overridable
-via ``TASQUE_PROXY_BASE_URL``. The OpenAI API key is a placeholder; the
-proxy ignores it but ``ChatOpenAI`` requires *something* non-empty.
+via ``TASQUE_PROXY_BASE_URL``. The model ids may point at any upstream
+selected by ``tasque proxy``. The OpenAI API key is a placeholder; the proxy
+ignores it but ``ChatOpenAI`` requires *something* non-empty.
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ from typing import Any, Literal, get_args
 from langchain_openai import ChatOpenAI
 
 AgentKind = Literal["coach", "strategist", "worker", "planner"]
-Tier = Literal["opus", "sonnet", "haiku"]
+Tier = Literal["large", "medium", "small"]
 
 ALL_AGENT_KINDS: tuple[AgentKind, ...] = get_args(AgentKind)
 ALL_TIERS: tuple[Tier, ...] = get_args(Tier)
@@ -32,27 +33,23 @@ ALL_TIERS: tuple[Tier, ...] = get_args(Tier)
 DEFAULT_PROXY_BASE_URL = "http://localhost:3456/v1"
 DEFAULT_PROXY_API_KEY = "tasque-proxy-no-key"
 
-# Hardcoded latest-known model ids per tier. Override with
-# ``TASQUE_MODEL_<TIER>`` when a newer one ships.
-DEFAULT_TIER_MODEL: dict[Tier, str] = {
-    "opus": "claude-opus-4-7",
-    "sonnet": "claude-sonnet-4-6",
-    "haiku": "claude-haiku-4-5",
-}
-
 # Built-in default tier per agent kind. Coach and strategist are fixed
 # here; worker and planner are kept for backwards compatibility but the
 # real per-row tier comes from QueuedJob.tier and PlanNode.tier.
 DEFAULT_AGENT_TIER: dict[AgentKind, Tier] = {
-    "coach": "opus",
-    "strategist": "opus",
-    "planner": "opus",
-    "worker": "haiku",
+    "coach": "large",
+    "strategist": "large",
+    "planner": "large",
+    "worker": "small",
 }
 
 
 class UnknownTierError(ValueError):
-    """Raised when a string isn't one of opus/sonnet/haiku."""
+    """Raised when a string isn't one of large/medium/small."""
+
+
+class MissingModelEnvError(ValueError):
+    """Raised when a tier has no concrete model id configured."""
 
 
 def coerce_tier(value: str) -> Tier:
@@ -66,11 +63,12 @@ def coerce_tier(value: str) -> Tier:
 
 def resolve_model_id_for_tier(tier: Tier) -> str:
     """Return the model id for ``tier`` after applying env overrides."""
+    coerce_tier(tier)
     tier_env = f"TASQUE_MODEL_{tier.upper()}"
     override = os.environ.get(tier_env)
     if override:
         return override
-    return DEFAULT_TIER_MODEL[tier]
+    raise MissingModelEnvError(f"{tier_env} is required for tier {tier!r}")
 
 
 def resolve_model_id(agent_kind: AgentKind) -> str:
@@ -78,6 +76,8 @@ def resolve_model_id(agent_kind: AgentKind) -> str:
     kind_env = f"TASQUE_MODEL_{agent_kind.upper()}"
     override = os.environ.get(kind_env)
     if override:
+        if override in ALL_TIERS:
+            return resolve_model_id_for_tier(override)
         return override
 
     tier = DEFAULT_AGENT_TIER[agent_kind]
@@ -104,8 +104,9 @@ def _build_chat(
         "api_key": _proxy_api_key(),
     }
     if disallowed_tools:
-        # Forwarded to the tasque proxy as a vendor extension; the proxy
-        # turns it into ``claude --print --disallowedTools <comma-list>``.
+        # Forwarded to the tasque proxy as a vendor extension. The Claude
+        # upstream turns it into ``--disallowedTools``; other upstreams get
+        # an equivalent prompt-level instruction when no CLI flag exists.
         existing_extra = kwargs.pop("extra_body", None) or {}
         if not isinstance(existing_extra, dict):
             existing_extra = {}
@@ -130,7 +131,7 @@ def get_chat_model(
     env vars are intentionally not provided — set them at the call site.
 
     ``disallowed_tools`` is a per-call denylist forwarded to the tasque
-    proxy and on to ``claude --print --disallowedTools``. Use it when a
+    proxy and on to the selected upstream's tool-deny mechanism. Use it when a
     call site must not invoke certain MCP tools (e.g. the bucket coach's
     post-reply trigger excluding chain-fire tools the synchronous reply
     has already exercised).
@@ -150,7 +151,7 @@ def get_chat_model_for_tier(
     disallowed_tools: list[str] | None = None,
     **kwargs: Any,
 ) -> ChatOpenAI:
-    """Return a ``ChatOpenAI`` for ``tier`` ("opus" / "sonnet" / "haiku").
+    """Return a ``ChatOpenAI`` for ``tier`` ("large" / "medium" / "small").
 
     Used by the worker and planner, whose tier is chosen per-row rather
     than fixed by agent kind. ``tier`` must be one of :data:`ALL_TIERS`;

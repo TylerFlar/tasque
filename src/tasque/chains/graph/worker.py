@@ -10,7 +10,7 @@ with the consumes payload, and write the outcome back to chain state:
 If the step had ``on_failure="replan"`` and failed, we also flip
 ``state.replan = True`` so the supervisor routes to the planner next pass.
 
-The worker LLM gets the tasque MCP injected by ``claude --print`` (see
+The worker LLM gets the tasque MCP injected by the selected upstream (see
 ``src/tasque/mcp/server.py``). Side-effects — queueing a follow-up job,
 writing a Note, firing a sub-chain, sending a Signal — happen
 synchronously through MCP tool calls during the worker's turn. The
@@ -71,10 +71,12 @@ def _augment_directive_with_schema(
     for key, item_schema in list_items.items():
         item_required = item_schema.get("required") or []
         bounds: list[str] = []
-        if isinstance(item_schema.get("min_count"), int):
-            bounds.append(f"min={item_schema['min_count']}")
-        if isinstance(item_schema.get("max_count"), int):
-            bounds.append(f"max={item_schema['max_count']}")
+        min_count = item_schema.get("min_count")
+        if isinstance(min_count, int):
+            bounds.append(f"min={min_count}")
+        max_count = item_schema.get("max_count")
+        if isinstance(max_count, int):
+            bounds.append(f"max={max_count}")
         bounds_str = f" ({', '.join(bounds)})" if bounds else ""
         if item_required:
             parts.append(

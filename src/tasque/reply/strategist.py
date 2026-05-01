@@ -1,7 +1,7 @@
 """Strategist reply binding.
 
 System prompt = ``prompts/strategist.md`` verbatim. Tools come from the
-tasque MCP injected by ``claude --print`` (see ``src/tasque/mcp/server.py``).
+tasque MCP injected by the selected upstream (see ``src/tasque/mcp/server.py``).
 There is no post-reply hook: the strategist has no auto-trigger queue.
 A reply does its work synchronously via MCP tool calls, and the next
 scheduled monitoring run picks up shifts on the next cycle.

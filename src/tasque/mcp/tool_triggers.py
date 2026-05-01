@@ -44,15 +44,27 @@ def _coerce_bucket(value: Any) -> Bucket | None:
     return None
 
 
-def _on_note_create(*, bucket: Any, **_: Any) -> None:
+def _wake_note_bucket(tool_name: str, bucket: Any) -> None:
     b = _coerce_bucket(bucket)
     if b is None:
         return
     enqueue_fn(
         b,
-        reason=f"tool:note_create:{b}",
-        dedup_key=f"tool:note_create:{b}",
+        reason=f"tool:{tool_name}:{b}",
+        dedup_key=f"tool:{tool_name}:{b}",
     )
+
+
+def _on_note_create(*, bucket: Any, **_: Any) -> None:
+    _wake_note_bucket("note_create", bucket)
+
+
+def _on_note_update(*, bucket: Any, **_: Any) -> None:
+    _wake_note_bucket("note_update", bucket)
+
+
+def _on_note_supersede(*, bucket: Any, **_: Any) -> None:
+    _wake_note_bucket("note_supersede", bucket)
 
 
 def _on_signal_create(*, to_bucket: Any, from_bucket: Any = None, **_: Any) -> None:
@@ -94,6 +106,8 @@ def _on_aim_create(*, bucket: Any, scope: Any, **_: Any) -> None:
 
 _HANDLERS: dict[str, Callable[..., None]] = {
     "note_create": _on_note_create,
+    "note_update": _on_note_update,
+    "note_supersede": _on_note_supersede,
     "signal_create": _on_signal_create,
     "aim_create": _on_aim_create,
 }

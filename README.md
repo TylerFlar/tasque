@@ -8,11 +8,11 @@ Discord is the conversational surface; the CLI is the read interface.
 
 ## Architecture in one paragraph
 
-tasque is the orchestration layer around your host's Claude CLI. Your
-host MCPs (calendar, browser, filesystem, course access, etc.) plug in
-via `~/.claude.json`; the daemon's LLM calls go through `tasque proxy`,
-which wraps `claude --print` as an OpenAI-compat endpoint, so every host
-MCP is inherited transparently. tasque also ships **its own MCP**
+tasque is the orchestration layer around your host's model CLI. Your
+host MCPs (calendar, browser, filesystem, course access, etc.) can plug in
+via Claude or Codex MCP config; the daemon's LLM calls go through
+`tasque proxy`, which wraps the selected upstream CLI as an OpenAI-compat
+endpoint. tasque also ships **its own MCP**
 (`tasque mcp`) you register the same way — that gives every coach,
 worker, and strategist run a live tool catalog for the daemon's own
 state (notes, queued jobs, chain templates, chain runs, signals). Memory
@@ -44,13 +44,13 @@ ids).
 #   - the worker run watcher (posts worker output to the jobs channel)
 #   - the chain resume ticker (boot resume of interrupted chains, then
 #     periodic stale-chain resume to pick up MCP-fired chains whose
-#     runner thread died with a finished claude --print subprocess)
+#     runner thread died with a finished upstream subprocess)
 # The bot's on_ready also installs the ops-panel watcher (the live
 # /status embed in the ops channel).
 uv run tasque serve
 
 # Start the LLM proxy in another shell — the daemon expects it on :3456.
-uv run tasque proxy
+TASQUE_PROXY_UPSTREAM=codex uv run tasque proxy
 ```
 
 Both are long-lived. Stop with Ctrl-C; shutdown is cooperative.
@@ -66,8 +66,8 @@ uv run tasque status --text     # human-readable
 
 ```
 tasque memory   import | export | wipe | prune | stats
-tasque proxy                                  # OpenAI-compat wrapper around claude --print
-tasque mcp                                    # tasque stdio MCP server (register in ~/.claude.json)
+tasque proxy                                  # OpenAI-compat wrapper around a local model CLI
+tasque mcp                                    # tasque stdio MCP server (register in your MCP host)
 tasque coach    wake <bucket>
 tasque jobs     queue | list | stop | tick
 tasque dlq      list | show | retry | resolve
@@ -119,53 +119,44 @@ artefacts from past schema reshapes, kept for reference.
 
 ## LLM proxy
 
-`tasque proxy` wraps the host's `claude --print` CLI as an OpenAI-compat
+`tasque proxy` wraps the selected local model CLI as an OpenAI-compat
 chat-completions endpoint on `http://localhost:3456/v1`. The daemon's
-ChatOpenAI clients point at this URL, so every MCP configured in your
-host `~/.claude.json` (calendar, browser, filesystem, …) is inherited
-without re-implementing MCP plumbing.
+ChatOpenAI clients point at this URL, so MCP tools configured in the
+selected host can be used without re-implementing MCP plumbing.
 
 ```bash
-uv run tasque proxy                 # binds 127.0.0.1:3456
+TASQUE_PROXY_UPSTREAM=codex uv run tasque proxy  # binds 127.0.0.1:3456
+uv run tasque proxy --upstream claude            # explicit Claude upstream
 uv run tasque proxy --port 3500     # custom port
 TASQUE_PROXY_MAX_CONCURRENT=8 uv run tasque proxy
-TASQUE_PROXY_TIMEOUT=120 uv run tasque proxy   # per-request wall-clock cap
 ```
 
 Knobs:
 
+- `TASQUE_PROXY_UPSTREAM` — required when `--upstream` is not passed.
+  Set to `codex` or `claude`.
 - `TASQUE_PROXY_MAX_CONCURRENT` (default 4) — semaphore cap on in-flight
-  `claude --print` invocations. Higher than 1 so nested LLM calls through
+  upstream CLI invocations. Higher than 1 so nested LLM calls through
   MCPs that route back through the proxy don't deadlock.
-- `TASQUE_PROXY_TIMEOUT` — optional float seconds applied to
-  `subprocess.communicate(timeout=…)`. Unset means no timeout; trust outer
-  guards (the daemon sets per-step timeouts).
-- `TASQUE_PROXY_STALL_SECONDS` (default 300) — stdout-silence threshold
-  for the stall watchdog. If a `claude --print` subprocess produces zero
-  bytes for this long AND no idle-silence budget is in effect, the proxy
-  kills it as hung. Set to `0` to disable the kill (the heartbeat log
-  still fires every 60s of silence). Agents declare upcoming silent
-  stretches via the `claim_idle_silence` MCP tool — see the tasque MCP
-  section below.
 - `TASQUE_PROXY_LOG_DIR` (default `data/proxy-logs`) — per-request raw
   stream-json transcripts, named `<request_id>.jsonl`. Files older than
   7 days are pruned at startup.
-- `TASQUE_CLAUDE_CWD` — override the cwd used to spawn `claude --print`.
-  Defaults to the tasque project root so project-scoped MCP servers in
-  `~/.claude.json` resolve correctly regardless of where `tasque proxy`
-  was launched from.
+- `TASQUE_PROXY_CWD` — override the cwd used to spawn the upstream CLI.
+  Provider-specific `TASQUE_CLAUDE_CWD` and `TASQUE_CODEX_CWD` win when
+  set. Defaults to the tasque project root.
+- Codex runs with full filesystem access and no approval prompts via
+  `--dangerously-bypass-approvals-and-sandbox`; the proxy is unattended.
 
 Endpoints: `POST /v1/chat/completions`, `GET /healthz` (200 when
-`claude --version` succeeds, 503 otherwise; cached 30 s),
+the selected upstream's `--version` succeeds, 503 otherwise; cached 30 s),
 `GET /status` (in-flight count, capacity, totals, last error, and a
-per-request view with elapsed / idle / silence-budget state),
-`POST /v1/cancel/<request_id>` (kill an in-flight subprocess by id).
+per-request view with elapsed and idle state).
 
 ## tasque MCP
 
 `tasque mcp` is a stdio MCP server that exposes the daemon's own state
 (notes, queued jobs, chain templates, chain runs, signals) as live
-tools. Registering it in `~/.claude.json` puts those tools in front of
+tools. Registering it in your host MCP config puts those tools in front of
 every LLM call routed through the proxy — so the reactive bucket coach,
 the chain worker, the planner, and the strategist can all fire chains,
 queue jobs, edit templates, and write notes mid-turn. Without it,
@@ -176,7 +167,7 @@ continuing" need.
 Register it once:
 
 ```jsonc
-// ~/.claude.json
+// Example MCP host JSON config
 {
   "mcpServers": {
     "tasque": {
@@ -193,19 +184,20 @@ console script — whichever spawns the right venv.)
 Read tools take a required `intent` argument (one short sentence: "what
 you're looking for from this call"). When the raw JSON response exceeds
 the configured threshold (default ~60 KB; override via
-`TASQUE_MCP_CONDENSE_THRESHOLD`), the result is condensed by a haiku
+`TASQUE_MCP_CONDENSE_THRESHOLD`), the result is condensed by a small-tier
 call using `intent` as the filter and returned wrapped in
 `{"_condensed": true, "_intent": "...", "_original_bytes": N,
 "summary": "..."}`. Under the threshold the original payload is
-returned verbatim. Condensation is best-effort — if the haiku call
-fails, the original is returned. Write tools and the `submit_*` /
-`claim_idle_silence` tools do not take `intent`.
+returned verbatim. Condensation is best-effort — if the small-tier call
+fails, the original is returned. Write tools and the `submit_*` tools
+do not take `intent`.
 
 Tools exposed (full schemas are emitted on connect — your MCP host
 will list them):
 
-- **Notes** — `note_create`, `note_get`, `note_list`, `note_search`,
-  `note_search_any`, `note_search_fts`, `note_archive`.
+- **Notes** — `note_create`, `note_update`, `note_supersede`, `note_get`,
+  `note_list`, `note_search`, `note_search_any`, `note_search_fts`,
+  `note_archive`.
 - **Queued jobs** — `job_create`, `job_get`, `job_update`, `job_cancel`,
   `job_list`. Both one-shot and recurring (5-field cron, alias DOW).
 - **Chain templates** — `chain_template_create`, `chain_template_get`,
@@ -226,18 +218,10 @@ will list them):
   post-hoc JSON parsing of the model's text response — if the agent
   forgets to call its tool, the run is recorded as a failure. The
   worker runner gives the LLM one follow-up nudge before failing
-  (the haiku tier in particular sometimes finishes its turn with
+  (the small tier in particular sometimes finishes its turn with
   prose only); the reminder tells the model not to redo MCP side
   effects so the retry doesn't double-write notes or duplicate
   queued jobs. Idle rows are reaped hourly.
-- **Idle-silence claim** — `claim_idle_silence(seconds, reason)`.
-  Tells the proxy stall watchdog you're about to be silent for
-  `seconds` (training run, large download, slow scrape). Honest
-  estimate; over-budget re-engages the watchdog so genuine hangs
-  past the estimate still get caught. No-op (returns
-  `{"ok": false}`) when the call isn't running through `tasque
-  proxy`.
-
 Bucket scoping is by explicit argument: every write that touches a
 bucket takes a `bucket` parameter, validated against the nine canonical
 names. The agent's system prompt tells it which bucket it is; the LLM
@@ -264,14 +248,14 @@ With the MCP registered:
 
 ### Proxy smoke test
 
-With the Claude CLI installed and authenticated:
+With the selected upstream CLI installed and authenticated:
 
 ```bash
-uv run tasque proxy &
+TASQUE_PROXY_UPSTREAM=codex uv run tasque proxy &
 
 curl -s -X POST localhost:3456/v1/chat/completions \
   -H 'content-type: application/json' \
-  -d '{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"reply with the single word: OK"}]}'
+  -d '{"model":"gpt-5.4-mini","messages":[{"role":"user","content":"reply with the single word: OK"}]}'
 # → JSON body whose choices[0].message.content contains "OK"
 
 curl -s localhost:3456/healthz   # → {"status":"ok"}
@@ -284,16 +268,16 @@ Two paths, depending on agent kind:
 **Coach + strategist** (fixed-role) resolution priority (highest first):
 
 1. `TASQUE_MODEL_<KIND>` — per-agent override (`COACH`, `STRATEGIST`).
-2. `TASQUE_MODEL_<TIER>` — tier override (`OPUS`, `SONNET`, `HAIKU`).
-3. Built-in defaults — both default to the opus tier.
+2. `TASQUE_MODEL_<TIER>` — tier alias (`LARGE`, `MEDIUM`, `SMALL`).
+3. Agent defaults — both default to the `large` tier.
 
 **Worker + chain planner**: tier is chosen per row (per `QueuedJob.tier`
 and per chain plan node / chain spec `planner_tier`). The kind-level
-env overrides do **not** apply here — only the tier override and the
-built-in defaults do.
+env overrides do **not** apply here — only `TASQUE_MODEL_LARGE`,
+`TASQUE_MODEL_MEDIUM`, and `TASQUE_MODEL_SMALL` are used.
 
-See [src/tasque/llm/factory.py](src/tasque/llm/factory.py) for the
-current default model ids.
+Tier aliases are provider-agnostic scheduling labels stored in the DB.
+Set them to concrete model ids for the selected upstream.
 
 ## Coaches
 
@@ -307,7 +291,7 @@ The coach is fired exclusively through a single SQLite-backed trigger
 queue. Worker completion, Discord replies, scheduled wakes, and MCP
 tool execution all `enqueue(bucket, reason, dedup_key)`; the drainer
 claims rows serially per bucket and runs the coach LangGraph. The
-MCP-tool source covers cases where another Claude session (or the user
+MCP-tool source covers cases where another model session (or the user
 via an MCP host) writes a Note, sends a Signal, or creates a
 bucket-scoped Aim through tasque MCP — see
 [src/tasque/mcp/tool_triggers.py](src/tasque/mcp/tool_triggers.py)
@@ -345,8 +329,8 @@ surfaces:
   sentinel `[strategist:monitor]`; the worker dispatcher routes that
   to the monitoring graph instead of an LLM call.
 
-The strategist uses the opus tier by default, same resolution rules as
-coaches (`TASQUE_MODEL_STRATEGIST` → `TASQUE_MODEL_OPUS` → built-in).
+The strategist uses the `large` tier by default, same resolution rules as
+coaches (`TASQUE_MODEL_STRATEGIST` → `TASQUE_MODEL_LARGE`).
 
 ## Jobs
 
@@ -583,5 +567,5 @@ uv run ruff check src tests
 uv run pyright
 ```
 
-Tests run against a temp SQLite DB and a stubbed proxy — no live Claude
+Tests run against a temp SQLite DB and a stubbed proxy — no live model
 CLI or Discord token required.

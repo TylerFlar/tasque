@@ -83,9 +83,9 @@ def _spec() -> dict[str, Any]:
         "chain_name": "approval-demo",
         "bucket": "personal",
         "recurrence": None,
-        "planner_tier": "opus",
+        "planner_tier": "large",
         "plan": [
-            {"id": "scan", "kind": "worker", "directive": "scan", "tier": "haiku"},
+            {"id": "scan", "kind": "worker", "directive": "scan", "tier": "small"},
             {
                 "id": "decide",
                 "kind": "approval",

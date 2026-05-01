@@ -1,6 +1,6 @@
 """The planner node.
 
-Calls the opus-tier ``planner`` LLM with the current plan, completed
+Calls the large-tier ``planner`` LLM with the current plan, completed
 outputs, and failures. The model emits a single fenced JSON block with a
 list of mutations to apply atomically:
 
@@ -46,7 +46,7 @@ exactly once with the ``result_token`` from the user message:
       mutations=[
         { "op": "add_step", "node": { "id": "...", "kind": "worker",
             "directive": "...", "depends_on": [...], "consumes": [...],
-            "tier": "haiku" | "sonnet" | "opus" } },
+            "tier": "small" | "medium" | "large" } },
         { "op": "remove_step", "id": "..." },
         { "op": "reorder_deps", "id": "...", "depends_on": [...] },
         { "op": "abort_chain" }
@@ -57,10 +57,10 @@ Rules:
 - Only mutate; do not return a fully rewritten plan.
 - ``add_step`` nodes are validated against the spec — same field rules
   as a YAML node. ``origin`` is forced to ``"planner"`` regardless.
-  Worker nodes MUST include ``tier`` (one of "opus" / "sonnet" /
-  "haiku"); approval nodes must NOT include a tier. Pick haiku for
-  trivial nudges, sonnet for multi-step tool / scrape / summarize work,
-  opus for agentic planning or deep generation.
+  Worker nodes MUST include ``tier`` (one of "large" / "medium" /
+  "small"); approval nodes must NOT include a tier. Pick small for
+  trivial nudges, medium for multi-step tool / scrape / summarize work,
+  large for agentic planning or deep generation.
 - ``remove_step`` is a no-op if the id isn't present.
 - ``abort_chain`` halts everything; use sparingly.
 - Empty mutations list is fine — pass ``mutations=[]`` if the failure

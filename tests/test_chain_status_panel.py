@@ -404,9 +404,9 @@ def _spec() -> dict[str, Any]:
         "chain_name": "status-demo",
         "bucket": "personal",
         "recurrence": None,
-        "planner_tier": "opus",
+        "planner_tier": "large",
         "plan": [
-            {"id": "scan", "kind": "worker", "directive": "scan", "tier": "haiku"},
+            {"id": "scan", "kind": "worker", "directive": "scan", "tier": "small"},
             {
                 "id": "decide",
                 "kind": "approval",
@@ -628,9 +628,9 @@ def _spec_single_worker() -> dict[str, Any]:
         "chain_name": "single-worker-demo",
         "bucket": "personal",
         "recurrence": None,
-        "planner_tier": "opus",
+        "planner_tier": "large",
         "plan": [
-            {"id": "only", "kind": "worker", "directive": "do thing", "tier": "haiku"},
+            {"id": "only", "kind": "worker", "directive": "do thing", "tier": "small"},
         ],
     }
 

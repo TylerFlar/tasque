@@ -27,6 +27,7 @@ from tasque.chains.registry import (
     reload_templates,
 )
 from tasque.chains.scheduler import (
+    claim_and_run_ready_chains,
     fire_due_chain_templates,
     launch_chain_run,
     resume_interrupted_chains,
@@ -48,6 +49,7 @@ __all__ = [
     "MirrorMismatch",
     "PlanNode",
     "SpecError",
+    "claim_and_run_ready_chains",
     "create_chain_template",
     "delete_chain_template",
     "dlq_retry",

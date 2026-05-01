@@ -1,8 +1,8 @@
 """The tasque stdio MCP server.
 
 Exposes the daemon's full write surface — notes, queued jobs, aims,
-chain templates, chain runs, signals — as MCP tools that any
-``claude --print`` invocation through the proxy can call mid-turn.
+chain templates, chain runs, signals — as MCP tools that any upstream
+invocation through the proxy can call mid-turn.
 The reactive bucket coach, the chain worker, the planner, the
 strategist, and the reply runtimes all share this catalog and act
 through it directly: tool call → result observed in the same turn →
@@ -22,7 +22,6 @@ object(s) directly.
 from __future__ import annotations
 
 import json
-import os
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
@@ -151,6 +150,7 @@ def _serialize_note(n: Note, *, truncate: int | None = None) -> dict[str, Any]:
         "durability": n.durability,
         "source": n.source,
         "archived": n.archived,
+        "superseded_by": n.superseded_by,
         "created_at": n.created_at,
         "updated_at": n.updated_at,
         "meta": n.meta,
@@ -188,6 +188,9 @@ def _serialize_chain_run(r: ChainRun) -> dict[str, Any]:
         "template_id": r.template_id,
         "thread_id": r.thread_id,
         "started_at": r.started_at,
+        "last_heartbeat": r.last_heartbeat,
+        "lease_owner": r.lease_owner,
+        "lease_expires_at": r.lease_expires_at,
         "ended_at": r.ended_at,
         "created_at": r.created_at,
         "updated_at": r.updated_at,
@@ -256,7 +259,7 @@ def build_server() -> FastMCP:
             "sentence describing what you want from this call (e.g. "
             "'durable health notes mentioning sleep', 'pending jobs in "
             "career'). When the raw result exceeds ~60KB it is condensed "
-            "by a haiku call using your intent as the filter and returned "
+            "by a small-tier call using your intent as the filter and returned "
             "as {\"_condensed\": true, \"_intent\": ..., \"summary\": "
             "...}. Write a precise intent — vague intents waste the "
             "condense pass."
@@ -293,6 +296,101 @@ def build_server() -> FastMCP:
         written = write_entity(n)
         dispatch_tool_event("note_create", bucket=bucket, source=source)
         return _ok(id=written.id)
+
+    @mcp.tool()
+    def note_update(
+        note_id: str,
+        content: str | None = None,
+        bucket: str | None = None,
+        durability: str | None = None,
+        meta: dict[str, Any] | None = None,
+    ) -> str:
+        """Patch an existing Note. Only provide fields you intend to
+        change. Use this for small corrections (typos, wrong bucket,
+        metadata fixes). For replacing a stale durable/behavioral memory
+        with a new fact, prefer ``note_supersede`` so the old version is
+        preserved for audit but hidden from default reads."""
+        if (
+            content is None
+            and bucket is None
+            and durability is None
+            and meta is None
+        ):
+            return _err("provide at least one field to update")
+        if content is not None and not content.strip():
+            return _err("content must be a non-empty string when provided")
+        if bucket is not None and (msg := _validate_bucket(bucket)) is not None:
+            return _err(msg)
+        if durability is not None and (msg := _validate_durability(durability)) is not None:
+            return _err(msg)
+        changed_buckets: set[str] = set()
+        with get_session() as sess:
+            row = sess.get(Note, note_id)
+            if row is None:
+                return _err(f"no Note with id={note_id}")
+            if isinstance(row.bucket, str) and row.bucket in ALL_BUCKETS:
+                changed_buckets.add(row.bucket)
+            if content is not None:
+                row.content = content
+            if bucket is not None:
+                row.bucket = bucket
+            if durability is not None:
+                row.durability = durability
+            if meta is not None:
+                row.meta = meta
+            row.updated_at = utc_now_iso()
+            sess.flush()
+            if isinstance(row.bucket, str) and row.bucket in ALL_BUCKETS:
+                changed_buckets.add(row.bucket)
+            note = _serialize_note(row)
+
+        for changed_bucket in sorted(changed_buckets):
+            dispatch_tool_event("note_update", bucket=changed_bucket)
+        return _ok(id=note_id, note=note)
+
+    @mcp.tool()
+    def note_supersede(
+        note_id: str,
+        content: str,
+        durability: str | None = None,
+        meta: dict[str, Any] | None = None,
+    ) -> str:
+        """Replace a Note with a new Note while preserving audit history.
+        The old note gets ``superseded_by=<new id>`` and ``archived=True``,
+        so default searches see the replacement, not both versions.
+
+        Omit ``durability`` to carry over the old durability. Omit
+        ``meta`` to carry over old metadata; provide it to replace the
+        metadata on the new note."""
+        if not content.strip():
+            return _err("content must be a non-empty string")
+        if durability is not None and (msg := _validate_durability(durability)) is not None:
+            return _err(msg)
+        changed_bucket: str | None = None
+        with get_session() as sess:
+            old = sess.get(Note, note_id)
+            if old is None:
+                return _err(f"no Note with id={note_id}")
+            new_note = Note(
+                content=content,
+                bucket=old.bucket,
+                durability=durability or old.durability,
+                source=old.source,
+                meta=dict(old.meta or {}) if meta is None else meta,
+            )
+            sess.add(new_note)
+            sess.flush()
+            old.superseded_by = new_note.id
+            old.archived = True
+            old.updated_at = utc_now_iso()
+            sess.flush()
+            if isinstance(old.bucket, str) and old.bucket in ALL_BUCKETS:
+                changed_bucket = old.bucket
+            note = _serialize_note(new_note)
+
+        if changed_bucket is not None:
+            dispatch_tool_event("note_supersede", bucket=changed_bucket)
+        return _ok(id=note["id"], superseded_id=note_id, note=note)
 
     @mcp.tool()
     def note_get(intent: str, note_id: str) -> str:
@@ -455,7 +553,7 @@ def build_server() -> FastMCP:
         params: dict[str, Any] = {"bucket": bucket, "query": query, "limit": limit}
         sql = (
             "SELECT n.id, n.content, n.bucket, n.durability, n.source, "
-            "  n.archived, n.created_at, n.updated_at, n.metadata "
+            "  n.archived, n.created_at, n.updated_at, n.metadata, n.superseded_by "
             "FROM notes_fts JOIN notes n ON n.id = notes_fts.note_id "
             "WHERE notes_fts.bucket = :bucket "
             "  AND notes_fts.archived = 0 "
@@ -493,6 +591,7 @@ def build_server() -> FastMCP:
                     "created_at": row[6],
                     "updated_at": row[7],
                     "meta": meta,
+                    "superseded_by": row[9],
                 }
             )
         return maybe_condense(
@@ -521,8 +620,8 @@ def build_server() -> FastMCP:
         queued_by: str = "mcp",
     ) -> str:
         """Insert a pending QueuedJob. ``tier`` is REQUIRED — one of
-        "opus", "sonnet", "haiku". Pick haiku for trivial nudges, sonnet
-        for multi-step tool / scrape / summarize work, opus for agentic
+        "large", "medium", "small". Pick small for trivial nudges, medium
+        for multi-step tool / scrape / summarize work, large for agentic
         planning, code iteration, or deep creative generation.
 
         ``fire_at`` is "now" or an ISO-8601 UTC timestamp. ``recurrence``
@@ -795,90 +894,6 @@ def build_server() -> FastMCP:
         return _ok()
 
     @mcp.tool()
-    def claim_idle_silence(seconds: int, reason: str) -> str:
-        """Tell the tasque proxy you're about to be silent for ``seconds``.
-
-        Call this BEFORE you start any tool call you expect to take
-        more than ~2 minutes (model training, large download, long
-        sleep, slow scrape). The proxy spawned this run inside a
-        ``claude --print`` subprocess and runs a stall watchdog: if
-        stdout produces zero bytes for longer than its threshold AND
-        no idle-silence budget is in effect, it kills the subprocess
-        as hung. Without this call, a legitimate 30-min training job
-        looks identical to a hang and gets killed.
-
-        With this call, the watchdog grants the silence — no kill
-        until the budget expires, even with stdout completely silent.
-        If you're still mid-work when the budget runs out, call
-        ``claim_idle_silence`` again to extend.
-
-        - ``seconds``: how long you expect to be silent. Must be > 0.
-          Honest estimate is fine; over-budget always re-engages the
-          watchdog so a hung tool past your estimate still gets caught.
-        - ``reason``: short label ("training task1", "scraping
-          leaderboard", "sleeping for cron") — surfaced in
-          ``/status`` and in stall logs.
-
-        Returns ``{"ok": true, "granted_until_iso": "...", "remaining_s":
-        <float>}`` on success, or ``{"ok": false, "error": "..."}``
-        when not running under the proxy (no ``TASQUE_PROXY_REQUEST_ID``
-        in env — common for CLI-driven runs that don't go through the
-        proxy at all) or on a transport error.
-
-        Idempotent — extends rather than resets. Calling twice with
-        ``seconds=600`` doesn't grant 1200s; the larger of the two
-        ``now + seconds`` deadlines wins.
-        """
-        if not isinstance(seconds, int) or seconds <= 0:  # pyright: ignore[reportUnnecessaryIsInstance]
-            return _err("seconds must be a positive integer")
-        if not isinstance(reason, str) or not reason.strip():  # pyright: ignore[reportUnnecessaryIsInstance]
-            return _err("reason must be a non-empty string")
-        request_id = os.environ.get("TASQUE_PROXY_REQUEST_ID")
-        base_url = os.environ.get("TASQUE_PROXY_INTERNAL_URL")
-        if not request_id or not base_url:
-            return _err(
-                "no proxy context: TASQUE_PROXY_REQUEST_ID / "
-                "TASQUE_PROXY_INTERNAL_URL not set in env. This run "
-                "isn't going through tasque proxy, so there's no "
-                "watchdog to extend. (Skip the call.)"
-            )
-        # Lazy import: keep ``mcp serve`` startup cost low for the
-        # common case where this tool isn't called.
-        import urllib.error
-        import urllib.request
-
-        url = f"{base_url.rstrip('/')}/v1/internal/idle_grant/{request_id}"
-        body = json.dumps({"seconds": seconds, "reason": reason}).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=body,
-            headers={"content-type": "application/json"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            try:
-                err_body = json.loads(exc.read().decode("utf-8"))
-            except Exception:
-                err_body = {"message": str(exc)}
-            err_obj = err_body.get("error") if isinstance(err_body, dict) else None
-            err_msg = (
-                err_obj.get("message", err_body)
-                if isinstance(err_obj, dict)
-                else err_body
-            )
-            return _err(f"proxy returned HTTP {exc.code}: {err_msg}")
-        except Exception as exc:
-            return _err(f"proxy unreachable: {type(exc).__name__}: {exc}")
-        return _ok(
-            granted_until_iso=payload.get("granted_until_iso"),
-            remaining_s=payload.get("remaining_s"),
-            reason=payload.get("reason"),
-        )
-
-    @mcp.tool()
     def submit_planner_result(
         result_token: str,
         mutations: list[dict[str, Any]] | None = None,
@@ -1099,10 +1114,11 @@ def build_server() -> FastMCP:
         """One-shot launch a saved ChainTemplate by name.
 
         **Fire-and-forget**: returns the new ``chain_id`` in
-        milliseconds — the chain runs in the background. Use
-        ``chain_run_get`` to poll status, or watch the chain status
-        thread the daemon publishes. ``thread_id`` is normally None;
-        the daemon's chain-status watcher creates the Discord thread.
+        milliseconds. The daemon-owned chain runner claims and invokes
+        the row via a DB lease. Use ``chain_run_get`` to poll status,
+        or watch the chain status thread the daemon publishes.
+        ``thread_id`` is normally None; the daemon's chain-status
+        watcher creates the Discord thread.
 
         ``vars`` is an optional run-time override dict, merged over the
         template's static ``vars`` (caller wins on key collision).
@@ -1137,9 +1153,10 @@ def build_server() -> FastMCP:
         ``plan_json`` is the JSON-encoded chain spec.
 
         **Fire-and-forget**: returns the new ``chain_id`` in
-        milliseconds — the chain runs in the background. Use this for
-        one-off multi-step work; if you'll run the same shape
-        repeatedly, ``chain_template_create`` it first instead.
+        milliseconds. The daemon-owned chain runner claims and invokes
+        the row via a DB lease. Use this for one-off multi-step work;
+        if you'll run the same shape repeatedly,
+        ``chain_template_create`` it first instead.
 
         ``vars`` works the same as for ``chain_fire_template``: an
         optional run-time override dict merged over the spec's static
@@ -1547,12 +1564,12 @@ def build_server() -> FastMCP:
     # side effect; pyright's reportUnusedFunction can't see that, so we
     # bind the inner names here to mark them deliberately registered.
     _ = (
-        note_create, note_get, note_list, note_search, note_search_any,
+        note_create, note_update, note_supersede,
+        note_get, note_list, note_search, note_search_any,
         note_search_fts, note_archive,
         job_create, job_get, job_update, job_cancel, job_list,
         submit_worker_result,
         submit_coach_result,
-        claim_idle_silence,
         submit_planner_result,
         submit_strategist_result,
         chain_template_create, chain_template_get, chain_template_list,
@@ -1573,8 +1590,7 @@ def run_stdio() -> None:
     process closes the pipe (which is how stdio MCPs shut down).
 
     Intended to be invoked by a host that registers tasque in its MCP
-    config — typically ``claude --print`` via the user's ``~/.claude.json``,
-    spawned anew per request and inherited by the proxy.
+    config, spawned anew per request and inherited by the proxy.
     """
     server = build_server()
     server.run("stdio")

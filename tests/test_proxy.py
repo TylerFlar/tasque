@@ -7,6 +7,7 @@ port in a background thread and is exercised via stdlib `urllib.request`.
 
 from __future__ import annotations
 
+import io
 import json
 import threading
 import time
@@ -26,19 +27,13 @@ FIXTURE_STREAM = Path(__file__).parent / "fixtures" / "sample_stream.jsonl"
 class _FakeStream:
     """Iterable byte-line reader satisfying the subset of ``BufferedReader``
     the proxy uses (line iteration). Sleeps once on first read so the
-    concurrency test can still observe queue back-pressure.
-
-    Watchdog tests use ``kill_event``: when set, the next ``__next__``
-    breaks out of any pending wait and raises ``StopIteration`` to mirror
-    real ``Popen.kill()`` closing stdout."""
+    concurrency and in-flight status tests can still observe queue
+    back-pressure."""
 
     def __init__(
         self,
         payload: str,
         delay: float,
-        *,
-        kill_event: threading.Event | None = None,
-        block_until_killed: bool = False,
     ) -> None:
         self._lines = [
             (line + "\n").encode("utf-8")
@@ -46,8 +41,6 @@ class _FakeStream:
         ]
         self._delay = delay
         self._slept = False
-        self._kill_event = kill_event
-        self._block_until_killed = block_until_killed
 
     def __iter__(self) -> _FakeStream:
         return self
@@ -57,10 +50,6 @@ class _FakeStream:
             time.sleep(self._delay)
             self._slept = True
         if not self._lines:
-            if self._block_until_killed and self._kill_event is not None:
-                # Stay silent until the watchdog (or test) signals kill.
-                self._kill_event.wait()
-                raise StopIteration
             raise StopIteration
         return self._lines.pop(0)
 
@@ -76,15 +65,11 @@ class _FakeStdin:
 class FakePopen:
     """Stand-in for `subprocess.Popen` returning canned stream-json output.
 
-    The proxy now streams ``proc.stdout`` line-by-line and then calls
-    ``communicate`` only to drain stderr — so the fake exposes a
-    line-iterable ``stdout`` and a ``communicate`` that returns no
-    additional stdout.
+    The proxy streams ``proc.stdout`` line-by-line, drains ``stderr`` on a
+    side thread, and waits for the child to finish.
 
-    With ``block_until_killed=True``, the stdout stream stays silent
-    after exhausting any canned lines until ``kill()`` is called or the
-    external ``kill_event`` is set — used to test the stall watchdog
-    and the cancel endpoint without timing on real subprocess behavior.
+    Tests use delayed successful output to observe in-flight requests because
+    the proxy no longer kills quiet upstream processes.
     """
 
     def __init__(
@@ -94,31 +79,16 @@ class FakePopen:
         stderr: str = "",
         returncode: int = 0,
         delay: float = 0.0,
-        block_until_killed: bool = False,
     ) -> None:
         self._stderr = stderr
         self.returncode = returncode
         self.killed = False
-        self._kill_event = threading.Event()
-        self.stdout = _FakeStream(
-            stdout,
-            delay,
-            kill_event=self._kill_event,
-            block_until_killed=block_until_killed,
-        )
-        self.stderr = None  # proxy reads stderr via communicate, not directly
+        self.stdout = _FakeStream(stdout, delay)
+        self.stderr = io.BytesIO(self._stderr.encode("utf-8"))
         self.stdin = _FakeStdin()
-
-    def communicate(
-        self,
-        input: bytes | None = None,
-        timeout: float | None = None,
-    ) -> tuple[bytes, bytes]:
-        return b"", self._stderr.encode("utf-8")
 
     def kill(self) -> None:
         self.killed = True
-        self._kill_event.set()
 
     def poll(self) -> int | None:
         # Mirror real Popen: ``None`` while running, exit code once
@@ -127,6 +97,9 @@ class FakePopen:
             return self.returncode
         return None
 
+    def wait(self) -> int:
+        return self.returncode
+
 
 def _make_popen_factory(
     *,
@@ -134,7 +107,6 @@ def _make_popen_factory(
     stderr: str = "",
     returncode: int = 0,
     delay: float = 0.0,
-    block_until_killed: bool = False,
     sink: list[FakePopen] | None = None,
 ) -> Callable[..., FakePopen]:
     def factory(*_args: Any, **_kwargs: Any) -> FakePopen:
@@ -143,7 +115,6 @@ def _make_popen_factory(
             stderr=stderr,
             returncode=returncode,
             delay=delay,
-            block_until_killed=block_until_killed,
         )
         if sink is not None:
             sink.append(fake)
@@ -163,6 +134,16 @@ def fake_claude_path(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
+def fake_codex_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make `shutil.which("codex")` resolve to a fake absolute path."""
+    monkeypatch.setattr(
+        proxy_server.shutil,
+        "which",
+        lambda name: "/fake/bin/codex" if name == "codex" else None,
+    )
+
+
+@pytest.fixture
 def running_proxy(
     tmp_path: Path,
 ) -> Iterator[Callable[[int], tuple[proxy_server.ThreadingHTTPServer, int]]]:
@@ -178,9 +159,9 @@ def running_proxy(
         srv, _state = proxy_server.make_server(
             host="127.0.0.1",
             port=0,
+            upstream="claude",
             max_concurrent=max_concurrent,
             log_dir=tmp_path / "logs",
-            timeout=None,
         )
         thread = threading.Thread(target=srv.serve_forever, daemon=True)
         thread.start()
@@ -197,7 +178,7 @@ def running_proxy(
             thread.join(timeout=2)
 
 
-def _post_chat(port: int, *, model: str = "claude-haiku-4-5", content: str = "hi") -> dict[str, Any]:
+def _post_chat(port: int, *, model: str = "test-small-model", content: str = "hi") -> dict[str, Any]:
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}/v1/chat/completions",
         data=json.dumps(
@@ -269,10 +250,89 @@ def test_parse_stream_json_raises_when_truncated_with_no_events() -> None:
         proxy_server._parse_stream_json(transcript, exit_code=1, stderr="")
 
 
+def test_parse_codex_exec_json_extracts_agent_message_and_usage() -> None:
+    transcript = "\n".join(
+        [
+            json.dumps({"type": "turn.started"}),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"type": "agentMessage", "text": "hello from codex"},
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "turn.completed",
+                    "turn": {
+                        "tokenUsage": {
+                            "last": {"inputTokens": 7, "outputTokens": 4}
+                        }
+                    },
+                }
+            ),
+        ]
+    )
+    text, usage = proxy_server._parse_codex_exec_json(
+        transcript,
+        exit_code=0,
+        stderr="",
+    )
+    assert text == "hello from codex"
+    assert usage == {"input_tokens": 7, "output_tokens": 4}
+
+
+def test_log_stream_event_counts_current_codex_mcp_tool_shape() -> None:
+    started_at = time.monotonic()
+    event = {
+        "type": "item.started",
+        "item": {
+            "id": "item_4",
+            "type": "mcp_tool_call",
+            "server": "google-workspace",
+            "tool": "listGmailThreads",
+            "status": "in_progress",
+        },
+    }
+
+    tool_calls, saw_text = proxy_server._log_stream_event(
+        event,
+        request_id_short="abc12345",
+        model="gpt-5.4",
+        started_at=started_at,
+        saw_first_text=False,
+    )
+
+    assert tool_calls == 1
+    assert saw_text is False
+
+
+def test_log_stream_event_treats_current_codex_agent_message_as_update() -> None:
+    started_at = time.monotonic()
+    event = {
+        "type": "item.completed",
+        "item": {
+            "id": "item_2",
+            "type": "agent_message",
+            "text": "I am checking the inbox before deciding what to archive.",
+        },
+    }
+
+    tool_calls, saw_text = proxy_server._log_stream_event(
+        event,
+        request_id_short="abc12345",
+        model="gpt-5.4",
+        started_at=started_at,
+        saw_first_text=False,
+    )
+
+    assert tool_calls == 0
+    assert saw_text is True
+
+
 def test_build_claude_argv_omits_disallowed_when_none() -> None:
     argv = proxy_server._build_claude_argv(
         exe="/fake/bin/claude",
-        model="claude-haiku-4-5",
+        model="test-small-model",
         prompt="hi",
         use_stdin=False,
     )
@@ -282,7 +342,7 @@ def test_build_claude_argv_omits_disallowed_when_none() -> None:
 def test_build_claude_argv_appends_disallowed_tools_csv() -> None:
     argv = proxy_server._build_claude_argv(
         exe="/fake/bin/claude",
-        model="claude-haiku-4-5",
+        model="test-small-model",
         prompt="hi",
         use_stdin=False,
         disallowed_tools=["mcp__tasque__chain_fire_template", "mcp__tasque__job_create"],
@@ -291,6 +351,36 @@ def test_build_claude_argv_appends_disallowed_tools_csv() -> None:
     assert argv[flag_idx + 1] == (
         "mcp__tasque__chain_fire_template,mcp__tasque__job_create"
     )
+
+
+def test_build_codex_argv_uses_exec_json_and_stdin(tmp_path: Path) -> None:
+    argv = proxy_server._build_codex_argv(
+        exe="/fake/bin/codex",
+        model="gpt-5.4-mini",
+        cwd=tmp_path,
+    )
+    assert argv[:2] == ["/fake/bin/codex", "exec"]
+    assert "--json" in argv
+    assert "--ephemeral" in argv
+    assert "--dangerously-bypass-approvals-and-sandbox" in argv
+    assert "--output-last-message" not in argv
+    assert "--model" in argv
+    assert argv[argv.index("--model") + 1] == "gpt-5.4-mini"
+    assert "--cd" in argv
+    assert argv[argv.index("--cd") + 1] == str(tmp_path)
+    assert argv[-1] == "-"
+
+
+def test_resolve_upstream_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TASQUE_PROXY_UPSTREAM", "codex")
+    assert proxy_server._env_upstream() == "codex"
+
+
+def test_resolve_upstream_requires_explicit_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("TASQUE_PROXY_UPSTREAM", raising=False)
+    monkeypatch.setenv("TASQUE_PROXY_PROVIDER", "claude")
+    with pytest.raises(proxy_server.ProxyError, match="TASQUE_PROXY_UPSTREAM"):
+        proxy_server._env_upstream()
 
 
 def test_extract_disallowed_tools_reads_top_level_field() -> None:
@@ -335,7 +425,7 @@ def test_chat_completions_returns_openai_shape(
 
     body = _post_chat(port)
     assert body["object"] == "chat.completion"
-    assert body["model"] == "claude-haiku-4-5"
+    assert body["model"] == "test-small-model"
     assert body["choices"][0]["message"]["content"] == "hello"
     assert body["choices"][0]["finish_reason"] == "stop"
     assert body["usage"] == {
@@ -343,6 +433,64 @@ def test_chat_completions_returns_openai_shape(
         "completion_tokens": 3,
         "total_tokens": 13,
     }
+
+
+@pytest.mark.usefixtures("fake_codex_path")
+def test_chat_completions_can_use_codex_upstream(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, list[str]] = {}
+    transcript = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"type": "agentMessage", "text": "hello codex"},
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "turn.completed",
+                    "turn": {"usage": {"input_tokens": 8, "output_tokens": 2}},
+                }
+            ),
+        ]
+    )
+
+    def factory(*args: Any, **_kwargs: Any) -> FakePopen:
+        captured["argv"] = list(args[0])
+        return FakePopen(stdout=transcript)
+
+    monkeypatch.setattr(proxy_server.subprocess, "Popen", factory)
+    srv, _state = proxy_server.make_server(
+        host="127.0.0.1",
+        port=0,
+        upstream="codex",
+        max_concurrent=2,
+        log_dir=tmp_path / "logs",
+    )
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        body = _post_chat(port=srv.server_address[1], model="gpt-5.4-mini")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        thread.join(timeout=2)
+
+    assert body["model"] == "gpt-5.4-mini"
+    assert body["choices"][0]["message"]["content"] == "hello codex"
+    assert body["usage"] == {
+        "prompt_tokens": 8,
+        "completion_tokens": 2,
+        "total_tokens": 10,
+    }
+    argv = captured["argv"]
+    assert argv[:2] == ["/fake/bin/codex", "exec"]
+    assert "--json" in argv
+    assert "--output-last-message" not in argv
+    assert argv[-1] == "-"
 
 
 @pytest.mark.usefixtures("fake_claude_path")
@@ -364,7 +512,7 @@ def test_chat_completions_forwards_disallowed_tools_to_argv(
         f"http://127.0.0.1:{port}/v1/chat/completions",
         data=json.dumps(
             {
-                "model": "claude-haiku-4-5",
+                "model": "test-small-model",
                 "messages": [{"role": "user", "content": "hi"}],
                 "disallowed_tools": [
                     "mcp__tasque__chain_fire_template",
@@ -452,7 +600,7 @@ def test_malformed_stream_returns_502(
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}/v1/chat/completions",
         data=json.dumps(
-            {"model": "claude-haiku-4-5", "messages": [{"role": "user", "content": "hi"}]}
+            {"model": "test-small-model", "messages": [{"role": "user", "content": "hi"}]}
         ).encode("utf-8"),
         headers={"content-type": "application/json"},
         method="POST",
@@ -527,7 +675,7 @@ def test_chat_completions_rejects_missing_messages(
     _, port = running_proxy(2)
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}/v1/chat/completions",
-        data=json.dumps({"model": "claude-haiku-4-5"}).encode("utf-8"),
+        data=json.dumps({"model": "test-small-model"}).encode("utf-8"),
         headers={"content-type": "application/json"},
         method="POST",
     )
@@ -537,27 +685,8 @@ def test_chat_completions_rejects_missing_messages(
 
 
 # ---------------------------------------------------------------------------
-# stall watchdog + idle-grant + cancel endpoints
+# long-running request behavior
 # ---------------------------------------------------------------------------
-
-
-def _post_json(
-    port: int,
-    path: str,
-    body: dict[str, Any] | None = None,
-) -> tuple[int, dict[str, Any]]:
-    data = json.dumps(body or {}).encode("utf-8")
-    req = urllib.request.Request(
-        f"http://127.0.0.1:{port}{path}",
-        data=data,
-        headers={"content-type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            return resp.status, dict(json.loads(resp.read().decode("utf-8")))
-    except urllib.error.HTTPError as exc:
-        return exc.code, dict(json.loads(exc.read().decode("utf-8")))
 
 
 def _wait_until(predicate: Callable[[], bool], *, timeout: float = 3.0) -> bool:
@@ -570,276 +699,44 @@ def _wait_until(predicate: Callable[[], bool], *, timeout: float = 3.0) -> bool:
 
 
 @pytest.mark.usefixtures("fake_claude_path")
-def test_stall_kill_after_silence_with_no_budget(
+def test_quiet_request_waits_for_upstream_without_kill(
     monkeypatch: pytest.MonkeyPatch,
     running_proxy: Callable[[int], tuple[proxy_server.ThreadingHTTPServer, int]],
 ) -> None:
-    """Subprocess silent past the stall threshold AND no idle-silence
-    budget ⇒ watchdog kills, request returns 502 with a stall message."""
-    monkeypatch.setenv("TASQUE_PROXY_STALL_SECONDS", "0.5")
     fakes: list[FakePopen] = []
     monkeypatch.setattr(
         proxy_server.subprocess,
         "Popen",
-        _make_popen_factory(stdout="", block_until_killed=True, sink=fakes),
-    )
-    _, port = running_proxy(2)
-
-    req = urllib.request.Request(
-        f"http://127.0.0.1:{port}/v1/chat/completions",
-        data=json.dumps(
-            {"model": "claude-haiku-4-5", "messages": [{"role": "user", "content": "hi"}]}
-        ).encode("utf-8"),
-        headers={"content-type": "application/json"},
-        method="POST",
-    )
-    with pytest.raises(urllib.error.HTTPError) as excinfo:
-        urllib.request.urlopen(req, timeout=10)
-    assert excinfo.value.code == 502
-    payload = json.loads(excinfo.value.read().decode("utf-8"))
-    assert "stall watchdog" in payload["error"]["message"]
-    # Watchdog must have actually called kill() on the fake.
-    assert fakes and fakes[0].killed
-
-
-@pytest.mark.usefixtures("fake_claude_path")
-def test_idle_grant_suppresses_stall_kill(
-    monkeypatch: pytest.MonkeyPatch,
-    running_proxy: Callable[[int], tuple[proxy_server.ThreadingHTTPServer, int]],
-) -> None:
-    """A claim_idle_silence call extends the silence budget so the
-    watchdog does NOT kill while the budget is in effect."""
-    monkeypatch.setenv("TASQUE_PROXY_STALL_SECONDS", "0.5")
-    fakes: list[FakePopen] = []
-    monkeypatch.setattr(
-        proxy_server.subprocess,
-        "Popen",
-        _make_popen_factory(stdout="", block_until_killed=True, sink=fakes),
-    )
-    _, port = running_proxy(2)
-
-    request_body = json.dumps(
-        {"model": "claude-haiku-4-5", "messages": [{"role": "user", "content": "hi"}]}
-    ).encode("utf-8")
-    chat_req = urllib.request.Request(
-        f"http://127.0.0.1:{port}/v1/chat/completions",
-        data=request_body,
-        headers={"content-type": "application/json"},
-        method="POST",
-    )
-
-    chat_result: dict[str, Any] = {}
-
-    def _fire() -> None:
-        try:
-            with urllib.request.urlopen(chat_req, timeout=10) as resp:
-                chat_result["status"] = resp.status
-        except urllib.error.HTTPError as exc:
-            chat_result["status"] = exc.code
-            chat_result["body"] = exc.read().decode("utf-8")
-
-    chat_thread = threading.Thread(target=_fire, daemon=True)
-    chat_thread.start()
-
-    # Wait until the request is registered, then grant a budget BEFORE
-    # the stall threshold (0.5s) elapses.
-    server, _ = running_proxy(2)  # reuse a registered fixture-spawned server
-    del server  # silence linter; we use the port from the first running_proxy
-
-    def _request_visible() -> bool:
-        _, body = _get(port, "/status")
-        return bool(body.get("requests"))
-
-    assert _wait_until(_request_visible, timeout=2.0), "request never registered"
-    _, status_body = _get(port, "/status")
-    request_id = status_body["requests"][0]["request_id"]
-
-    grant_status, grant_body = _post_json(
-        port,
-        f"/v1/internal/idle_grant/{request_id}",
-        {"seconds": 5, "reason": "training task1"},
-    )
-    assert grant_status == 200
-    assert grant_body["ok"] is True
-    assert grant_body["reason"] == "training task1"
-    assert grant_body["remaining_s"] >= 4.0
-
-    # Wait past where stall would have fired without the budget.
-    time.sleep(1.5)
-    assert not (fakes and fakes[0].killed), (
-        "watchdog killed despite active idle-silence budget"
-    )
-
-    # /status surfaces the budget so an operator can see the deferral.
-    _, mid_status = _get(port, "/status")
-    assert mid_status["requests"][0]["silence_budget_remaining_s"] is not None
-    assert mid_status["requests"][0]["silence_budget_reason"] == "training task1"
-
-    # Tear down: cancel so the chat thread doesn't hang the test.
-    _post_json(port, f"/v1/cancel/{request_id}")
-    chat_thread.join(timeout=5)
-    assert chat_result.get("status") == 502
-
-
-@pytest.mark.usefixtures("fake_claude_path")
-def test_cancel_endpoint_kills_running_request(
-    monkeypatch: pytest.MonkeyPatch,
-    running_proxy: Callable[[int], tuple[proxy_server.ThreadingHTTPServer, int]],
-) -> None:
-    """``POST /v1/cancel/{request_id}`` kills the matching subprocess
-    and the chat completion returns 502 with a cancelled message."""
-    # High stall threshold so we know the kill path is /cancel, not stall.
-    monkeypatch.setenv("TASQUE_PROXY_STALL_SECONDS", "60")
-    fakes: list[FakePopen] = []
-    monkeypatch.setattr(
-        proxy_server.subprocess,
-        "Popen",
-        _make_popen_factory(stdout="", block_until_killed=True, sink=fakes),
-    )
-    _, port = running_proxy(2)
-
-    chat_result: dict[str, Any] = {}
-    chat_req = urllib.request.Request(
-        f"http://127.0.0.1:{port}/v1/chat/completions",
-        data=json.dumps(
-            {"model": "claude-haiku-4-5", "messages": [{"role": "user", "content": "hi"}]}
-        ).encode("utf-8"),
-        headers={"content-type": "application/json"},
-        method="POST",
-    )
-
-    def _fire() -> None:
-        try:
-            with urllib.request.urlopen(chat_req, timeout=10) as resp:
-                chat_result["status"] = resp.status
-        except urllib.error.HTTPError as exc:
-            chat_result["status"] = exc.code
-            chat_result["body"] = exc.read().decode("utf-8")
-
-    t = threading.Thread(target=_fire, daemon=True)
-    t.start()
-
-    def _registered() -> bool:
-        _, body = _get(port, "/status")
-        return bool(body.get("requests"))
-
-    assert _wait_until(_registered, timeout=2.0)
-    _, status_body = _get(port, "/status")
-    request_id = status_body["requests"][0]["request_id"]
-
-    cancel_status, cancel_body = _post_json(port, f"/v1/cancel/{request_id}")
-    assert cancel_status == 200
-    assert cancel_body["ok"] is True
-
-    t.join(timeout=5)
-    assert chat_result.get("status") == 502
-    payload = json.loads(chat_result["body"])
-    assert "cancelled" in payload["error"]["message"]
-
-
-@pytest.mark.usefixtures("fake_claude_path")
-def test_idle_grant_unknown_request_id_returns_404(
-    running_proxy: Callable[[int], tuple[proxy_server.ThreadingHTTPServer, int]],
-) -> None:
-    _, port = running_proxy(2)
-    status, body = _post_json(
-        port,
-        "/v1/internal/idle_grant/does-not-exist",
-        {"seconds": 30, "reason": "x"},
-    )
-    assert status == 404
-    assert "unknown request_id" in body["error"]["message"]
-
-
-@pytest.mark.usefixtures("fake_claude_path")
-def test_cancel_unknown_request_id_returns_404(
-    running_proxy: Callable[[int], tuple[proxy_server.ThreadingHTTPServer, int]],
-) -> None:
-    _, port = running_proxy(2)
-    status, body = _post_json(port, "/v1/cancel/does-not-exist")
-    assert status == 404
-    assert "unknown request_id" in body["error"]["message"]
-
-
-@pytest.mark.usefixtures("fake_claude_path")
-def test_idle_grant_rejects_non_positive_seconds(
-    monkeypatch: pytest.MonkeyPatch,
-    running_proxy: Callable[[int], tuple[proxy_server.ThreadingHTTPServer, int]],
-) -> None:
-    monkeypatch.setenv("TASQUE_PROXY_STALL_SECONDS", "60")
-    monkeypatch.setattr(
-        proxy_server.subprocess,
-        "Popen",
-        _make_popen_factory(stdout="", block_until_killed=True),
-    )
-    _, port = running_proxy(2)
-
-    chat_thread = threading.Thread(
-        target=lambda: _post_json(
-            port,
-            "/v1/chat/completions",
-            {"model": "claude-haiku-4-5", "messages": [{"role": "user", "content": "x"}]},
+        _make_popen_factory(
+            stdout=FIXTURE_STREAM.read_text(encoding="utf-8"),
+            delay=0.2,
+            sink=fakes,
         ),
-        daemon=True,
-    )
-    chat_thread.start()
-
-    def _registered() -> bool:
-        _, body = _get(port, "/status")
-        return bool(body.get("requests"))
-
-    assert _wait_until(_registered, timeout=2.0)
-    _, status_body = _get(port, "/status")
-    request_id = status_body["requests"][0]["request_id"]
-
-    bad, body = _post_json(
-        port,
-        f"/v1/internal/idle_grant/{request_id}",
-        {"seconds": -5, "reason": "x"},
-    )
-    assert bad == 400
-    assert "seconds" in body["error"]["message"]
-    _post_json(port, f"/v1/cancel/{request_id}")
-    chat_thread.join(timeout=5)
-
-
-def test_resolve_stall_seconds_respects_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("TASQUE_PROXY_STALL_SECONDS", "12.5")
-    assert proxy_server._resolve_stall_seconds() == 12.5
-
-
-def test_resolve_stall_seconds_falls_back_on_garbage(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("TASQUE_PROXY_STALL_SECONDS", "not-a-number")
-    assert proxy_server._resolve_stall_seconds() == proxy_server.DEFAULT_STALL_SECONDS
-
-
-def test_resolve_stall_seconds_default_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("TASQUE_PROXY_STALL_SECONDS", raising=False)
-    assert proxy_server._resolve_stall_seconds() == proxy_server.DEFAULT_STALL_SECONDS
-
-
-@pytest.mark.usefixtures("fake_claude_path")
-def test_status_endpoint_includes_in_flight_request_metadata(
-    monkeypatch: pytest.MonkeyPatch,
-    running_proxy: Callable[[int], tuple[proxy_server.ThreadingHTTPServer, int]],
-) -> None:
-    """In-flight requests appear in /status with timing + budget fields."""
-    monkeypatch.setenv("TASQUE_PROXY_STALL_SECONDS", "30")
-    monkeypatch.setattr(
-        proxy_server.subprocess,
-        "Popen",
-        _make_popen_factory(stdout="", block_until_killed=True),
     )
     _, port = running_proxy(2)
 
-    chat_thread = threading.Thread(
-        target=lambda: _post_json(
-            port,
-            "/v1/chat/completions",
-            {"model": "claude-haiku-4-5", "messages": [{"role": "user", "content": "x"}]},
+    body = _post_chat(port)
+
+    assert body["choices"][0]["message"]["content"] == "hello"
+    assert fakes and not fakes[0].killed
+
+
+@pytest.mark.usefixtures("fake_claude_path")
+def test_status_endpoint_includes_in_flight_request_metadata_without_budgets(
+    monkeypatch: pytest.MonkeyPatch,
+    running_proxy: Callable[[int], tuple[proxy_server.ThreadingHTTPServer, int]],
+) -> None:
+    monkeypatch.setattr(
+        proxy_server.subprocess,
+        "Popen",
+        _make_popen_factory(
+            stdout=FIXTURE_STREAM.read_text(encoding="utf-8"),
+            delay=0.4,
         ),
-        daemon=True,
     )
+    _, port = running_proxy(2)
+
+    chat_thread = threading.Thread(target=lambda: _post_chat(port), daemon=True)
     chat_thread.start()
 
     def _registered() -> bool:
@@ -852,7 +749,5 @@ def test_status_endpoint_includes_in_flight_request_metadata(
     assert len(body["requests"]) == 1
     rec = body["requests"][0]
     assert {"request_id", "model", "elapsed_s", "last_byte_age_s"} <= set(rec.keys())
-    assert rec["model"] == "claude-haiku-4-5"
-    assert rec["silence_budget_remaining_s"] is None  # not granted yet
-    _post_json(port, f"/v1/cancel/{rec['request_id']}")
+    assert rec["model"] == "test-small-model"
     chat_thread.join(timeout=5)

@@ -270,7 +270,7 @@ async def test_route_per_job_thread_dispatches_to_job_bucket_coach() -> None:
             fire_at="now",
             status="completed",
             queued_by="creative",
-            tier="sonnet",
+            tier="medium",
             thread_id="7777",
         )
     )
@@ -398,7 +398,7 @@ async def test_route_per_job_thread_skips_when_bucketless_job() -> None:
             fire_at="now",
             status="completed",
             queued_by="cli",
-            tier="haiku",
+            tier="small",
             thread_id="4444",
         )
     )

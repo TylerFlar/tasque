@@ -130,8 +130,8 @@ def test_build_prompt_includes_scaffold_bucket_state_and_time(
     assert "tasque coach scaffolding" in sys_text
     assert "Sleep-and-recovery first" in sys_text  # health-bucket mindset present
     # System prompt is now stable across runs — time + reason are in the
-    # user message, NOT the system prompt. This is what lets Claude CLI's
-    # prefix cache hit on repeated runs of the same bucket.
+    # user message, NOT the system prompt. This is what lets upstream prefix
+    # caches hit on repeated runs of the same bucket when supported.
     assert "{now_utc}" not in sys_text
     assert "{reason}" not in sys_text
     assert "manual ping" not in sys_text

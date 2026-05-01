@@ -116,7 +116,7 @@ def _final_step_report(state: dict[str, Any] | None) -> str:
     if items:
         _step_id, output = items[-1]
         body = (output.get("report") or "").strip()
-    rollup = embeds._build_fan_out_rollup(state)
+    rollup = embeds.build_fan_out_rollup(state)
     if rollup:
         return (body + "\n\n" + rollup).strip() if body else rollup
     return body

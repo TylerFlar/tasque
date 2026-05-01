@@ -8,7 +8,7 @@ Same graph, parameterised by ``bucket`` carried in the state. The graph is
 compiled once and reused. The ``llm`` argument on ``run_bucket_coach`` lets
 tests inject a fake ``BaseChatModel`` returning canned JSON.
 
-Writes happen via the tasque MCP injected by ``claude --print`` (see
+Writes happen via the tasque MCP injected by the selected upstream (see
 ``src/tasque/mcp/server.py``) during the LLM's turn. The structured JSON
 the coach emits afterwards carries one field — ``thread_post`` — a
 runtime-controlled signal asking the Discord bot to publish a message
@@ -120,12 +120,12 @@ def _format_state_block(state: BucketCoachState) -> str:
 
     # Durable notes are NOT pre-injected. The bucket has potentially
     # hundreds of them; dumping all into every prompt floods the context.
-    # Use the search_notes / recent_notes / get_note tools to pull the
-    # specific durable facts relevant to this run's trigger.
+    # Use the note_search_fts / note_search / note_list / note_get MCP tools
+    # to pull the specific durable facts relevant to this run's trigger.
     parts.append(
         f"\n### Durable facts ({len(durable)} present in this bucket)"
-        f"\n_Not pre-injected. Call `search_notes(query, durability='durable')` "
-        f"or `recent_notes(durability='durable')` to retrieve specific facts "
+        f"\n_Not pre-injected. Call `note_search_fts(query, durability='durable')` "
+        f"or `note_list(durability='durable')` to retrieve specific facts "
         f"relevant to this run._"
     )
 
@@ -192,8 +192,8 @@ def _build_prompt(state: BucketCoachState) -> dict[str, Any]:
     bucket = state["bucket"]
     reason = state.get("reason", "")
     # System prompt = scaffold + bucket-mindset, with NO per-run substitutions
-    # so the underlying Claude CLI's prefix cache can hit across runs of the
-    # same bucket. Time + reason live in the user message instead.
+    # so upstream prefix caches can hit across runs of the same bucket when
+    # supported. Time + reason live in the user message instead.
     system_text = build_system_prompt(bucket)
     now_utc_s, now_local_s, tz_name = _format_time_block(reason)
     state_block = _format_state_block(state)
@@ -204,14 +204,16 @@ def _build_prompt(state: BucketCoachState) -> dict[str, Any]:
             "**Post-reply pass.** The user just received a synchronous reply "
             "in this thread; that reply already executed any action the user "
             "asked for. Your job here is consolidation only — note_create, "
-            "note_archive, signal_create, etc. The user-action tools "
+            "note_update, note_supersede, note_archive, signal_create, etc. "
+            "The user-action tools "
             "(``chain_fire_template``, ``chain_queue_adhoc``, ``job_create``) "
             "are disabled for this pass; do not attempt them."
         )
     else:
         action_guidance = (
             "Perform any writes via the tasque MCP now (note_create, "
-            "job_create, chain_fire_template, signal_create, …)."
+            "note_update, note_supersede, job_create, chain_fire_template, "
+            "signal_create, …)."
         )
     user_text = (
         "## Run context\n"
