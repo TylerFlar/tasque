@@ -69,6 +69,21 @@ def deposit(
         )
 
 
+def peek(result_token: str, *, agent_kind: str) -> bool:
+    """Return True if ``agent_kind`` has deposited under ``result_token``.
+
+    Non-consuming — leaves the row in place so the subsequent
+    :func:`read_and_consume` still finds it. Used by the worker runner
+    to detect a missed tool call mid-graph and decide whether to retry
+    the LLM turn before falling through to the failure path.
+    """
+    with get_session() as sess:
+        row = sess.get(AgentResult, result_token)
+        if row is None:
+            return False
+        return row.agent_kind == agent_kind
+
+
 def read_and_consume(
     result_token: str, *, agent_kind: str
 ) -> dict[str, Any] | None:
@@ -123,6 +138,7 @@ __all__ = [
     "DEFAULT_REAP_AGE_SECONDS",
     "deposit",
     "mint_token",
+    "peek",
     "read_and_consume",
     "reap_stale",
 ]

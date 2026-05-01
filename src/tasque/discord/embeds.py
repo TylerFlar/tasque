@@ -344,10 +344,7 @@ def build_chain_terminal_embed(
     # visible.
     rollup = _build_fan_out_rollup(state)
     if rollup:
-        if description:
-            description = description + "\n\n" + rollup
-        else:
-            description = rollup
+        description = description + "\n\n" + rollup if description else rollup
         description = _truncate(description, EMBED_DESC_LIMIT)
 
     embed: dict[str, Any] = {

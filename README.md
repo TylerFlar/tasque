@@ -224,8 +224,12 @@ will list them):
   drops the structured payload into a transient SQLite inbox; the
   Python-side runner reads-and-deletes by token. This replaces
   post-hoc JSON parsing of the model's text response — if the agent
-  forgets to call its tool, the run is recorded as a failure. Idle
-  rows are reaped hourly.
+  forgets to call its tool, the run is recorded as a failure. The
+  worker runner gives the LLM one follow-up nudge before failing
+  (the haiku tier in particular sometimes finishes its turn with
+  prose only); the reminder tells the model not to redo MCP side
+  effects so the retry doesn't double-write notes or duplicate
+  queued jobs. Idle rows are reaped hourly.
 - **Idle-silence claim** — `claim_idle_silence(seconds, reason)`.
   Tells the proxy stall watchdog you're about to be silent for
   `seconds` (training run, large download, slow scrape). Honest

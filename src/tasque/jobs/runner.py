@@ -224,6 +224,33 @@ def _build_prompt(state: WorkerState) -> dict[str, Any]:
     return {"messages": messages}
 
 
+def _extract_text(response: BaseMessage) -> str:
+    content = response.content
+    if isinstance(content, list):
+        text_parts: list[str] = []
+        for item in cast(list[Any], content):
+            if isinstance(item, dict):
+                d = cast(dict[str, Any], item)
+                t = d.get("text")
+                if isinstance(t, str):
+                    text_parts.append(t)
+            elif isinstance(item, str):
+                text_parts.append(item)
+        return "\n".join(text_parts)
+    return str(content)
+
+
+_RETRY_REMINDER = (
+    "You finished your turn without calling submit_worker_result. "
+    "Call it now exactly once with the result_token from the run "
+    "context above and your report / summary / produces. Do NOT redo "
+    "any work you already performed via other MCP tools — those side "
+    "effects already persisted; only the declarative end-of-turn "
+    "payload is missing. If your earlier turn produced a usable "
+    "report, reuse it verbatim."
+)
+
+
 def _call_llm(state: WorkerState) -> dict[str, Any]:
     llm = state.get("llm")
     if llm is None:
@@ -253,20 +280,35 @@ def _call_llm(state: WorkerState) -> dict[str, Any]:
                 error=f"LLM call failed: {type(exc).__name__}: {exc}",
             )
         }
-    content = response.content
-    if isinstance(content, list):
-        text_parts: list[str] = []
-        for item in cast(list[Any], content):
-            if isinstance(item, dict):
-                d = cast(dict[str, Any], item)
-                t = d.get("text")
-                if isinstance(t, str):
-                    text_parts.append(t)
-            elif isinstance(item, str):
-                text_parts.append(item)
-        text = "\n".join(text_parts)
-    else:
-        text = str(content)
+    text = _extract_text(response)
+
+    # Tool-call miss recovery: the haiku tier in particular sometimes
+    # finishes its turn with prose only and never invokes
+    # submit_worker_result, sinking the whole job. Give it one
+    # follow-up nudge before the persist node fails the run. The
+    # reminder explicitly tells the LLM not to redo MCP side effects
+    # so we don't double-write notes / queue duplicate jobs.
+    if not result_inbox.peek(state["result_token"], agent_kind="worker"):
+        try:
+            retry_response = llm.invoke(
+                [*list(messages), response, HumanMessage(content=_RETRY_REMINDER)]
+            )
+            text = _extract_text(retry_response) or text
+            log.info(
+                "jobs.runner.submit_worker_result_retry",
+                job_id=state["job_id"],
+                deposited=result_inbox.peek(
+                    state["result_token"], agent_kind="worker"
+                ),
+            )
+        except Exception as exc:
+            # Don't fail the run on a retry-side error — let persist_run
+            # surface the original "tool not called" message.
+            log.warning(
+                "jobs.runner.submit_worker_result_retry_failed",
+                job_id=state["job_id"],
+                error=f"{type(exc).__name__}: {exc}",
+            )
     return {"raw_response": text}
 
 
