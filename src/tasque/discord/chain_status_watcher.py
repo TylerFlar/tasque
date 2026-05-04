@@ -82,6 +82,15 @@ def _load_state(chain_id: str) -> dict[str, Any] | None:
     return raw
 
 
+def _chain_invoke_active(chain_id: str) -> bool:
+    try:
+        from tasque.chains.scheduler import is_chain_invoke_active
+
+        return is_chain_invoke_active(chain_id)
+    except Exception:
+        return False
+
+
 def _signature(embed: dict[str, Any]) -> str:
     """Stable hash key for the parts of the embed that should drive an
     edit. Field timestamps that move every tick (none currently — the
@@ -288,6 +297,21 @@ async def _tick(
             chain_run.status in ("completed", "failed", "stopped")
             and chain_run.status_message_id is None
         ):
+            continue
+
+        if chain_run.status == "stopped" and _chain_invoke_active(
+            chain_run.chain_id
+        ):
+            # ``chain_run_stop`` is cooperative: it records the stop
+            # request while any already-dispatched worker finishes. Wait
+            # until the active graph invoke exits before posting the
+            # one-shot terminal thread, otherwise self-stopping workers
+            # can produce an empty "stopped" report and then continue to
+            # write the useful final checkpoint milliseconds later.
+            log.debug(
+                "discord.chain_status.stopped_active_wait",
+                chain_id=chain_run.chain_id[:8],
+            )
             continue
 
         state = _load_state(chain_run.chain_id)

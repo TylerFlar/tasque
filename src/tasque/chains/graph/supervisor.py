@@ -41,6 +41,31 @@ APPROVAL_NODE = "approval"
 PLANNER_NODE = "planner"
 
 
+def _chain_stop_requested(chain_id: str | None) -> bool:
+    """Return True when the persisted ChainRun row has been stopped.
+
+    ``chain_run_stop`` can be called from outside the currently-running
+    LangGraph invoke (including by the worker's own MCP turn). The active
+    graph state may not include that checkpoint patch yet, so the
+    supervisor treats the row status as the durable stop-request source.
+    """
+    if not chain_id:
+        return False
+    try:
+        from sqlalchemy import select
+
+        from tasque.memory.db import get_session
+        from tasque.memory.entities import ChainRun
+
+        with get_session() as sess:
+            status = sess.execute(
+                select(ChainRun.status).where(ChainRun.chain_id == chain_id)
+            ).scalar_one_or_none()
+    except Exception:
+        return False
+    return status == "stopped"
+
+
 def _children_of(plan: list[PlanNode], template_id: str) -> list[PlanNode]:
     prefix = f"{template_id}["
     return [n for n in plan if n["id"].startswith(prefix)]
@@ -280,6 +305,27 @@ def supervisor(state: ChainStateSchema) -> dict[str, Any]:
                     "kind": "status",
                     "details": {"step": n["id"], "to": "completed"},
                 })
+
+    if _chain_stop_requested(state.get("chain_id")):
+        flipped = 0
+        for n in plan:
+            if n["status"] in ("pending", "running", "awaiting_user"):
+                n["status"] = "stopped"
+                flipped += 1
+        if flipped:
+            history_appends.append({
+                "timestamp": _now_iso(),
+                "kind": "pause",
+                "details": {
+                    "flipped": flipped,
+                    "to": "stopped",
+                    "reason": "chain_run_stop",
+                },
+            })
+        update: dict[str, Any] = {"plan": plan, "replan": False}
+        if history_appends:
+            update["history"] = history_appends
+        return update
 
     # 2. Materialize fan-outs (pending workers with fan_out_on, deps OK).
     #

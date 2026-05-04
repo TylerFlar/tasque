@@ -169,6 +169,87 @@ def test_stop_chain_marks_awaiting_step_stopped(
         assert row["ended_at"] is not None
 
 
+def test_self_stop_inside_worker_prevents_downstream_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A worker may call chain_run_stop through MCP during its own turn.
+
+    The active LangGraph invoke still merges that worker's result, but the
+    next supervisor pass must honor the persisted stop request before it
+    promotes downstream nodes.
+    """
+    calls: list[str | None] = []
+
+    def _fake(
+        job: Any,
+        *,
+        consumes: dict[str, Any] | None = None,
+        **_: Any,
+    ) -> WorkerResult:
+        calls.append(job.chain_step_id)
+        if job.chain_step_id == "gate":
+            from tasque.chains.manager import stop_chain
+
+            assert job.chain_id is not None
+            assert stop_chain(job.chain_id) is True
+            return WorkerResult(
+                report="all tasks already satisfy the threshold",
+                summary="no-op gate",
+                produces={"failing_tasks": []},
+                error=None,
+            )
+        return WorkerResult(
+            report="should not run",
+            summary="unexpected",
+            produces={},
+            error=None,
+        )
+
+    import tasque.chains.graph.worker as worker_mod
+
+    monkeypatch.setattr(worker_mod, "run_worker", _fake)
+
+    spec = {
+        "chain_name": "self-stop-demo",
+        "bucket": "education",
+        "recurrence": None,
+        "planner_tier": "large",
+        "plan": [
+            {"id": "gate", "kind": "worker", "directive": "gate", "tier": "small"},
+            {
+                "id": "downstream",
+                "kind": "worker",
+                "directive": "downstream",
+                "depends_on": ["gate"],
+                "consumes": ["gate"],
+                "tier": "small",
+            },
+        ],
+    }
+
+    chain_id = launch_chain_run(spec)
+
+    assert calls == ["gate"]
+
+    from tasque.chains.manager import get_chain_state
+
+    state = get_chain_state(chain_id)
+    assert state is not None
+    by_id = {n["id"]: n for n in state["plan"]}
+    assert by_id["gate"]["status"] == "completed"
+    assert by_id["downstream"]["status"] == "stopped"
+    assert "gate" in state["completed"]
+    assert "downstream" not in state["completed"]
+
+    with get_session() as sess:
+        row = sess.execute(
+            ChainRun.__table__.select().where(ChainRun.chain_id == chain_id)
+        ).mappings().first()
+        assert row is not None
+        assert row["status"] == "stopped"
+        assert row["ended_at"] is not None
+
+
 def test_launch_vars_reach_every_worker_call(monkeypatch: pytest.MonkeyPatch) -> None:
     """Operator-supplied ``vars`` at launch are merged over the spec's
     static ``vars`` and surface in every worker dispatch."""

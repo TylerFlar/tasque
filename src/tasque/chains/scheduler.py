@@ -150,6 +150,11 @@ def _is_invoke_active(chain_id: str) -> bool:
         return chain_id in _active_chain_invokes
 
 
+def is_chain_invoke_active(chain_id: str) -> bool:
+    """Return True while this process is actively invoking ``chain_id``."""
+    return _is_invoke_active(chain_id)
+
+
 def _new_chain_id() -> str:
     return uuid4().hex
 
@@ -200,6 +205,17 @@ def _set_run_terminal(chain_id: str, *, status: str) -> None:
         stmt = select(ChainRun).where(ChainRun.chain_id == chain_id)
         row = sess.execute(stmt).scalars().first()
         if row is None:
+            return
+        if row.status == "stopped" and status != "stopped":
+            row.lease_owner = None
+            row.lease_expires_at = None
+            row.updated_at = utc_now_iso()
+            log.info(
+                "chains.scheduler.terminal_preserved_stopped",
+                chain_id=chain_id[:8],
+                chain_name=row.chain_name,
+                requested=status,
+            )
             return
         row.status = status
         row.ended_at = utc_now_iso()
@@ -821,6 +837,7 @@ __all__ = [
     "DEFAULT_STALE_RESUME_THRESHOLD_SECONDS",
     "claim_and_run_ready_chains",
     "fire_due_chain_templates",
+    "is_chain_invoke_active",
     "launch_chain_run",
     "maybe_finalize_status",
     "resume_interrupted_chains",

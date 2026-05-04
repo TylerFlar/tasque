@@ -566,6 +566,98 @@ async def test_watcher_re_posts_after_edit_failure(
 
 
 @pytest.mark.asyncio
+async def test_watcher_delays_stopped_terminal_while_invoke_active(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cooperative stop request should not post the one-shot terminal
+    thread until the active graph invoke has had a chance to write its
+    final checkpoint.
+    """
+    threads.set_thread_id(threads.PURPOSE_JOBS, 4242)
+
+    fake = _FakePoster()
+    poster.set_client(fake)  # type: ignore[arg-type]
+
+    active = {"value": False}
+    monkeypatch.setattr(
+        chain_status_watcher,
+        "_chain_invoke_active",
+        lambda _chain_id: active["value"],
+    )
+
+    from tasque.memory.entities import ChainRun as ChainRunEntity
+    from tasque.memory.entities import utc_now_iso
+
+    chain_id = "cidstoppedactive0"
+    with get_session() as sess:
+        sess.add(
+            ChainRunEntity(
+                id="row" + chain_id[:8],
+                chain_id=chain_id,
+                chain_name="stop-demo",
+                bucket="education",
+                status="running",
+                started_at=utc_now_iso(),
+            )
+        )
+
+    def _jobs_posts() -> list[dict[str, Any]]:
+        return [
+            embed
+            for (channel_id, embed, _v) in fake.embeds_posted
+            if channel_id == 4242
+        ]
+
+    await chain_status_watcher.run_chain_status_watcher(
+        max_iterations=1, poll_seconds=0
+    )
+    assert _jobs_posts() == []
+
+    with get_session() as sess:
+        from sqlalchemy import update
+
+        sess.execute(
+            update(ChainRunEntity)
+            .where(ChainRunEntity.chain_id == chain_id)
+            .values(status="stopped", ended_at=utc_now_iso())
+        )
+
+    active["value"] = True
+    await chain_status_watcher.run_chain_status_watcher(
+        max_iterations=1, poll_seconds=0
+    )
+    assert _jobs_posts() == []
+
+    with get_session() as sess:
+        row = sess.execute(
+            ChainRunEntity.__table__.select().where(
+                ChainRunEntity.chain_id == chain_id
+            )
+        ).mappings().first()
+        assert row is not None
+        assert row["status_message_id"] is not None
+        assert row["terminal_notified_at"] is None
+
+    active["value"] = False
+    await chain_status_watcher.run_chain_status_watcher(
+        max_iterations=1, poll_seconds=0
+    )
+    jobs_posts = _jobs_posts()
+    assert len(jobs_posts) == 1
+    assert "Chain stopped" in jobs_posts[0]["title"]
+
+    with get_session() as sess:
+        row = sess.execute(
+            ChainRunEntity.__table__.select().where(
+                ChainRunEntity.chain_id == chain_id
+            )
+        ).mappings().first()
+        assert row is not None
+        assert row["terminal_notified_at"] is not None
+        assert row["status_message_id"] is None
+
+
+@pytest.mark.asyncio
 async def test_watcher_skips_terminal_chain_with_stale_message_id() -> None:
     """Daemon restart after long downtime: a terminal chain's cached
     message id is now too old to edit. The watcher must NOT post a
