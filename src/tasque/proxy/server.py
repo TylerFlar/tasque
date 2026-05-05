@@ -262,20 +262,100 @@ def _build_codex_argv(
     exe: str,
     model: str,
     cwd: Path,
+    mcp_servers: dict[str, dict[str, Any]] | None = None,
 ) -> list[str]:
-    return [
+    argv = [
         exe,
         "exec",
-        "--json",
-        "--ephemeral",
-        "--skip-git-repo-check",
-        "--dangerously-bypass-approvals-and-sandbox",
-        "--model",
-        model,
-        "--cd",
-        str(cwd),
-        "-",
     ]
+    for override in _codex_mcp_config_overrides(mcp_servers or {}):
+        argv.extend(["-c", override])
+    argv.extend(
+        [
+            "--json",
+            "--ephemeral",
+            "--skip-git-repo-check",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--model",
+            model,
+            "--cd",
+            str(cwd),
+            "-",
+        ]
+    )
+    return argv
+
+
+def _json_toml(value: str | list[str]) -> str:
+    """Render a TOML-compatible scalar or array for ``codex -c``."""
+    return json.dumps(value)
+
+
+def _inline_toml_table(value: dict[str, str]) -> str:
+    pairs = ", ".join(
+        f"{json.dumps(key)} = {json.dumps(val)}" for key, val in sorted(value.items())
+    )
+    return "{" + pairs + "}"
+
+
+def _codex_mcp_config_overrides(
+    mcp_servers: dict[str, dict[str, Any]],
+) -> list[str]:
+    overrides: list[str] = []
+    for server_name in sorted(mcp_servers):
+        server = mcp_servers[server_name]
+        command = server.get("command")
+        if not isinstance(command, str) or not command:
+            continue
+        raw_args = server.get("args", [])
+        args = [str(arg) for arg in raw_args] if isinstance(raw_args, list) else []
+        raw_env = server.get("env", {})
+        env = (
+            {str(k): str(v) for k, v in raw_env.items()}
+            if isinstance(raw_env, dict)
+            else {}
+        )
+        prefix = f"mcp_servers.{server_name}"
+        overrides.append(f"{prefix}.command={_json_toml(command)}")
+        overrides.append(f"{prefix}.args={_json_toml(args)}")
+        if env:
+            overrides.append(f"{prefix}.env={_inline_toml_table(env)}")
+    return overrides
+
+
+def _local_codex_mcp_servers() -> dict[str, dict[str, Any]]:
+    """MCP servers tasque itself requires every Codex proxy turn to have.
+
+    User/project Codex config still provides the broad personal tool catalog.
+    These local registrations make the daemon's own result-submission MCP and
+    the trading tool surface deterministic even when the mirrored user config
+    is stale or incomplete.
+    """
+    root = _project_root()
+    servers: dict[str, dict[str, Any]] = {
+        "tasque": {
+            "command": "uv",
+            "args": [
+                "run",
+                "--directory",
+                root.as_posix(),
+                "tasque",
+                "mcp",
+            ],
+        }
+    }
+    trading_project = root / "mcps" / "trading-mcp"
+    if trading_project.exists():
+        servers["trading-mcp"] = {
+            "command": "uv",
+            "args": [
+                "run",
+                "--project",
+                trading_project.as_posix(),
+                "trading-mcp-server",
+            ],
+        }
+    return servers
 
 
 def _prepend_disallowed_tool_instruction(prompt: str, disallowed_tools: list[str]) -> str:
@@ -361,6 +441,7 @@ def _invoke_upstream(
             exe=exe,
             model=model,
             cwd=upstream_cwd,
+            mcp_servers=_local_codex_mcp_servers(),
         )
     else:
         use_stdin = len(prompt.encode("utf-8")) >= PROMPT_STDIN_THRESHOLD

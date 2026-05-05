@@ -22,7 +22,8 @@ object(s) directly.
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+import os
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, cast
 
 from sqlalchemy import or_, select, text
@@ -74,12 +75,14 @@ from tasque.memory.entities import (
     Note,
     QueuedJob,
     Signal,
+    WorkerPattern,
     utc_now_iso,
 )
 from tasque.memory.repo import (
     archive as _archive_entity,
 )
 from tasque.memory.repo import (
+    search_worker_patterns,
     update_entity_status,
     write_entity,
 )
@@ -88,6 +91,9 @@ from tasque.memory.repo import (
 # nine canonical buckets are valid; the strategist agent and ad-hoc
 # system signals also need to be representable.
 _ALL_SIGNAL_FROMS: frozenset[str] = frozenset({*ALL_BUCKETS, "strategist", "system"})
+_AIM_CHAIN_DEDUP_SECONDS = 30 * 60
+_AIM_CHAIN_ACTIVE_STATUSES = frozenset({"running", "paused", "awaiting_approval"})
+_AIM_CHAIN_RECENT_TERMINAL_STATUSES = frozenset({"completed", "stopped"})
 
 if TYPE_CHECKING:  # pragma: no cover - imported only for type hints
     from mcp.server.fastmcp import FastMCP
@@ -100,8 +106,8 @@ def _ok(**fields: Any) -> str:
     return json.dumps({"ok": True, **fields}, default=str)
 
 
-def _err(message: str) -> str:
-    return json.dumps({"ok": False, "error": message})
+def _err(message: str, **fields: Any) -> str:
+    return json.dumps({"ok": False, "error": message, **fields}, default=str)
 
 
 def _validate_bucket(bucket: str) -> str | None:
@@ -123,6 +129,85 @@ def _validate_durability(durability: str) -> str | None:
         "durability must be 'ephemeral', 'durable', or 'behavioral', "
         f"got {durability!r}"
     )
+
+
+def _parse_utc_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        normalized = value
+        if normalized.endswith("Z"):
+            normalized = normalized[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _aim_chain_dedup_window() -> timedelta:
+    raw = os.environ.get("TASQUE_AIM_CHAIN_DEDUP_SECONDS")
+    seconds = float(_AIM_CHAIN_DEDUP_SECONDS)
+    if raw is not None:
+        try:
+            seconds = float(raw)
+        except ValueError:
+            seconds = float(_AIM_CHAIN_DEDUP_SECONDS)
+    return timedelta(seconds=max(0.0, seconds))
+
+
+def _chain_run_aim_id(row: ChainRun) -> str | None:
+    try:
+        initial = json.loads(row.initial_state_json or "{}")
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(initial, dict):
+        return None
+    vars_raw = initial.get("vars")
+    if not isinstance(vars_raw, dict):
+        return None
+    aim_id = vars_raw.get("aim_id")
+    return aim_id if isinstance(aim_id, str) and aim_id else None
+
+
+def _find_existing_aim_chain_run(spec: dict[str, Any]) -> ChainRun | None:
+    """Return a recent/active chain for the same Aim-derived spec, if any."""
+    chain_name = spec.get("chain_name")
+    vars_raw = spec.get("vars")
+    aim_id = vars_raw.get("aim_id") if isinstance(vars_raw, dict) else None
+    if not isinstance(chain_name, str) or not chain_name:
+        return None
+    if not isinstance(aim_id, str) or not aim_id:
+        return None
+
+    cutoff = datetime.now(UTC) - _aim_chain_dedup_window()
+    with get_session() as sess:
+        stmt = (
+            select(ChainRun)
+            .where(ChainRun.chain_name == chain_name)
+            .order_by(ChainRun.created_at.desc())
+            .limit(50)
+        )
+        rows = list(sess.execute(stmt).scalars().all())
+        for row in rows:
+            if _chain_run_aim_id(row) != aim_id:
+                continue
+            if row.status in _AIM_CHAIN_ACTIVE_STATUSES:
+                sess.expunge(row)
+                return row
+            if row.status in _AIM_CHAIN_RECENT_TERMINAL_STATUSES:
+                reference = (
+                    _parse_utc_iso(row.ended_at)
+                    or _parse_utc_iso(row.updated_at)
+                    or _parse_utc_iso(row.started_at)
+                    or _parse_utc_iso(row.created_at)
+                )
+                if reference is not None and reference >= cutoff:
+                    sess.expunge(row)
+                    return row
+        sess.expunge_all()
+    return None
 
 
 def _resolve_fire_at(fire_at: str, recurrence: str | None) -> str:
@@ -176,6 +261,23 @@ def _serialize_queued_job(j: QueuedJob) -> dict[str, Any]:
         "updated_at": j.updated_at,
         "last_summary": j.last_summary,
         "last_error": j.last_error,
+    }
+
+
+def _serialize_worker_pattern(p: WorkerPattern) -> dict[str, Any]:
+    return {
+        "id": p.id,
+        "bucket": p.bucket,
+        "source_kind": p.source_kind,
+        "key": p.key,
+        "content": p.content,
+        "tags": p.tags,
+        "meta": p.meta,
+        "success_count": p.success_count,
+        "last_used_at": p.last_used_at,
+        "created_at": p.created_at,
+        "updated_at": p.updated_at,
+        "archived": p.archived,
     }
 
 
@@ -253,7 +355,7 @@ def build_server() -> FastMCP:
             "system prompt names. Mutations return {\"ok\": true, ...} on "
             "success or {\"ok\": false, \"error\": \"...\"} on "
             "validation/runtime failure.\n\n"
-            "Read tools (note_*, job_get/list, chain_template_*, "
+            "Read tools (note_*, job_get/list, worker_pattern_search, chain_template_*, "
             "chain_run_get/list, signal_list, aim_get/list, "
             "bucket_summary) take a required `intent` argument: one short "
             "sentence describing what you want from this call (e.g. "
@@ -792,6 +894,42 @@ def build_server() -> FastMCP:
             tool_name="job_list",
         )
 
+    # ---------------------------------------------------- worker patterns
+
+    @mcp.tool()
+    def worker_pattern_search(
+        intent: str,
+        query: str,
+        bucket: str = "",
+        limit: int = 5,
+    ) -> str:
+        """Search compact successful-run patterns for worker precedent.
+
+        ``bucket`` defaults to ``""`` to search all buckets; pass the
+        current run's bucket for bucket-scoped recall. Search is keyword
+        based, not vector based. Returns active patterns ordered by simple
+        relevance, success count, and recency.
+
+        ``intent`` (required): one short sentence on what precedent you're
+        looking for — used to condense the result if oversize."""
+        bucket_value = bucket.strip()
+        if bucket_value and (msg := _validate_bucket(bucket_value)) is not None:
+            return _err(msg)
+        if not query.strip():
+            return json.dumps([])
+        if limit < 1:
+            return _err("limit must be >= 1")
+        rows = search_worker_patterns(
+            query=query,
+            bucket=bucket_value,
+            limit=limit,
+        )
+        return maybe_condense(
+            json.dumps([_serialize_worker_pattern(p) for p in rows], default=str),
+            intent=intent,
+            tool_name="worker_pattern_search",
+        )
+
     # ----------------------------------------------- agent result inbox
 
     @mcp.tool()
@@ -924,6 +1062,28 @@ def build_server() -> FastMCP:
             result_token=result_token,
             agent_kind="planner",
             payload={"mutations": muts},
+        )
+        return _ok()
+
+    @mcp.tool()
+    def submit_aim_chain_plan_result(
+        result_token: str,
+        plan: dict[str, Any] | None = None,
+    ) -> str:
+        """Submit the structured result of THIS Aim-to-chain planning run.
+
+        Call this exactly once with a complete Tasque chain spec in
+        ``plan``. The caller validates the spec with ``validate_spec`` and
+        then either queues it as an ad-hoc chain or saves it as a template.
+        """
+        if not isinstance(result_token, str) or not result_token.strip():  # pyright: ignore[reportUnnecessaryIsInstance]
+            return _err("result_token must be a non-empty string")
+        if not isinstance(plan, dict):  # pyright: ignore[reportUnnecessaryIsInstance]
+            return _err("plan must be an object")
+        result_inbox.deposit(
+            result_token=result_token,
+            agent_kind="aim_chain_plan",
+            payload={"plan": plan},
         )
         return _ok()
 
@@ -1515,6 +1675,81 @@ def build_server() -> FastMCP:
             tool_name="aim_list",
         )
 
+    @mcp.tool()
+    def aim_plan_chain(
+        aim_id: str,
+        mode: str = "adhoc",
+        enabled: bool = False,
+        thread_id: str | None = None,
+        planner_tier: str = "large",
+    ) -> str:
+        """Plan an Aim into a validated Tasque chain spec.
+
+        ``mode="adhoc"`` queues the validated spec as a one-shot chain.
+        ``mode="template"`` saves it as a ChainTemplate; templates are
+        disabled by default here, and only created enabled when
+        ``enabled=True`` is passed explicitly.
+        """
+        normalized_mode = mode.strip().lower()
+        if normalized_mode not in ("adhoc", "template"):
+            return _err("mode must be 'adhoc' or 'template'")
+        if (msg := _validate_tier(planner_tier)) is not None:
+            return _err(msg)
+
+        from tasque.strategist.graph import plan_chain_for_aim
+
+        planned = plan_chain_for_aim(
+            aim_id,
+            mode=normalized_mode,
+            planner_tier=planner_tier,
+        )
+        if not planned.get("ok"):
+            return json.dumps(planned, default=str)
+        spec = cast(dict[str, Any], planned.get("spec"))
+
+        if normalized_mode == "adhoc":
+            existing = _find_existing_aim_chain_run(spec)
+            if existing is not None:
+                return _ok(
+                    mode=normalized_mode,
+                    chain_id=existing.chain_id,
+                    chain_name=existing.chain_name,
+                    spec=spec,
+                    deduped=True,
+                    existing_status=existing.status,
+                )
+            try:
+                chain_id = launch_chain_run(
+                    spec,
+                    thread_id=thread_id,
+                    wait=False,
+                )
+            except (SpecError, MirrorMismatch, ValueError) as exc:
+                return _err(f"{type(exc).__name__}: {exc}", spec=spec)
+            return _ok(
+                mode=normalized_mode,
+                chain_id=chain_id,
+                chain_name=spec.get("chain_name"),
+                spec=spec,
+            )
+
+        recurrence = cast(str | None, spec.get("recurrence"))
+        try:
+            name = _create_template(
+                spec,
+                recurrence=recurrence,
+                enabled=enabled,
+            )
+        except (SpecError, MirrorMismatch, ValueError) as exc:
+            return _err(f"{type(exc).__name__}: {exc}", spec=spec)
+        return _ok(
+            mode=normalized_mode,
+            chain_name=name,
+            enabled=enabled,
+            template=_get_template(name),
+            spec=spec,
+        )
+
     # ------------------------------------------------- cross-bucket view
 
     @mcp.tool()
@@ -1568,9 +1803,11 @@ def build_server() -> FastMCP:
         note_get, note_list, note_search, note_search_any,
         note_search_fts, note_archive,
         job_create, job_get, job_update, job_cancel, job_list,
+        worker_pattern_search,
         submit_worker_result,
         submit_coach_result,
         submit_planner_result,
+        submit_aim_chain_plan_result,
         submit_strategist_result,
         chain_template_create, chain_template_get, chain_template_list,
         chain_template_update, chain_template_delete,
@@ -1578,7 +1815,7 @@ def build_server() -> FastMCP:
         chain_run_get, chain_run_list, chain_run_pause, chain_run_resume,
         chain_run_stop,
         signal_create, signal_list, signal_archive,
-        aim_create, aim_get, aim_update, aim_list,
+        aim_create, aim_get, aim_update, aim_list, aim_plan_chain,
         bucket_summary,
     )
 

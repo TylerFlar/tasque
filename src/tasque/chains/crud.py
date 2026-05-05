@@ -82,12 +82,14 @@ def create_chain_template(
     *,
     recurrence: str | None = None,
     seed_path: str | None = None,
+    enabled: bool = True,
 ) -> str:
     """Insert a new ``ChainTemplate`` and return its ``chain_name``.
 
     Validates the spec, enforces the mirror-column contract, and rejects
     duplicate names. The ``recurrence`` keyword and ``plan_dict["recurrence"]``
     must match — pass ``None`` for both if there is no schedule.
+    ``enabled`` defaults to True to preserve the normal template-create path.
     """
     validate_spec(plan_dict)
     enforce_mirror(plan_dict, recurrence=recurrence)
@@ -101,7 +103,7 @@ def create_chain_template(
             chain_name=name,
             bucket=plan_dict.get("bucket"),
             recurrence=recurrence,
-            enabled=True,
+            enabled=enabled,
             plan_json=json.dumps(plan_dict),
             seed_path=seed_path,
         )

@@ -285,3 +285,78 @@ def test_resume_interrupted_chains_retries_failed_steps(
             select(ChainRun).where(ChainRun.chain_id == chain_id)
         ).scalars().one()
         assert row2.status == "completed"
+
+
+def test_resume_interrupted_chains_attempts_each_chain_once_when_retry_still_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A boot-recovery pass should not reclaim the same still-wedged
+    running chain repeatedly in one call.
+    """
+    pull_calls = {"count": 0}
+
+    def _fake(job: Any, *, consumes: dict[str, Any] | None = None, **_: Any) -> WorkerResult:
+        if job.chain_step_id == "sources":
+            return WorkerResult(
+                report="ok",
+                summary="ok",
+                produces={"items": ["a"]},
+                error=None,
+            )
+        if job.chain_step_id == "pull[0]":
+            pull_calls["count"] += 1
+            return WorkerResult(
+                report="",
+                summary="",
+                produces={},
+                error="still failing",
+            )
+        if job.chain_step_id == "consolidate":
+            return WorkerResult(report="done", summary="done", produces={}, error=None)
+        return WorkerResult(report="ok", summary="ok", produces={}, error=None)
+
+    import tasque.chains.graph.worker as worker_mod
+
+    monkeypatch.setattr(worker_mod, "run_worker", _fake)
+
+    spec: dict[str, Any] = {
+        "chain_name": "still-wedged-on-fanout",
+        "bucket": "personal",
+        "recurrence": None,
+        "planner_tier": "large",
+        "plan": [
+            {"id": "sources", "kind": "worker", "directive": "list", "tier": "small"},
+            {
+                "id": "pull",
+                "kind": "worker",
+                "directive": "pull one item",
+                "depends_on": ["sources"],
+                "consumes": ["sources"],
+                "fan_out_on": "items",
+                "tier": "small",
+            },
+            {
+                "id": "consolidate",
+                "kind": "worker",
+                "directive": "roll up",
+                "depends_on": ["pull"],
+                "consumes": ["pull"],
+                "tier": "small",
+            },
+        ],
+    }
+
+    from tasque.chains.scheduler import launch_chain_run, resume_interrupted_chains
+
+    chain_id = launch_chain_run(spec)
+    assert pull_calls["count"] == 1
+
+    resumed = resume_interrupted_chains()
+
+    assert resumed == [chain_id]
+    assert pull_calls["count"] == 2
+    snap = get_chain_state(chain_id)
+    assert snap is not None
+    statuses = {n["id"]: n["status"] for n in snap["plan"]}
+    assert statuses["pull[0]"] == "failed"
+    assert statuses["consolidate"] == "pending"

@@ -20,6 +20,7 @@ from tasque.memory.entities import (
     Note,
     QueuedJob,
     Signal,
+    WorkerPattern,
 )
 from tasque.memory.exporters import export_jsonl
 from tasque.memory.importers import import_jsonl, import_markdown_dir
@@ -120,7 +121,17 @@ def cmd_prune(
 def cmd_stats() -> None:
     """Print row counts per entity type as JSON."""
     counts: dict[str, int] = {}
-    classes = (Note, Aim, Signal, QueuedJob, FailedJob, ChainTemplate, ChainRun, Attachment)
+    classes = (
+        Note,
+        Aim,
+        Signal,
+        QueuedJob,
+        WorkerPattern,
+        FailedJob,
+        ChainTemplate,
+        ChainRun,
+        Attachment,
+    )
     with get_session() as sess:
         for cls in classes:
             n = sess.scalar(select(func.count()).select_from(cls))

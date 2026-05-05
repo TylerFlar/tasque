@@ -36,6 +36,10 @@ def _empty_str_dict() -> dict[str, str]:
     return {}
 
 
+def _empty_str_list() -> list[str]:
+    return []
+
+
 class Base(DeclarativeBase):
     pass
 
@@ -139,6 +143,46 @@ class QueuedJob(Base):
     last_report: Mapped[str | None] = mapped_column(Text, nullable=True)
     last_produces_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[str] = mapped_column(String(32), default=utc_now_iso, nullable=False)
+    updated_at: Mapped[str] = mapped_column(
+        String(32), default=utc_now_iso, onupdate=utc_now_iso, nullable=False
+    )
+
+
+class WorkerPattern(Base):
+    """Compact successful-run memory for future worker prompts.
+
+    These rows are intentionally separate from general Notes: they are
+    deterministic digests of successful worker runs, retrieved by keyword
+    search and injected only into worker prompts when relevant.
+    """
+
+    __tablename__ = "worker_patterns"
+    __table_args__ = (
+        UniqueConstraint(
+            "bucket",
+            "source_kind",
+            "key",
+            name="uq_worker_patterns_bucket_source_key",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_uuid)
+    bucket: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    source_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    key: Mapped[str] = mapped_column(String(128), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    tags: Mapped[list[str]] = mapped_column(
+        JSON, default=_empty_str_list, nullable=False
+    )
+    # Python attribute is ``meta`` because ``metadata`` is reserved on
+    # DeclarativeBase. The SQL column and JSONL key remain ``metadata``.
+    meta: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSON, default=_empty_dict, nullable=False
+    )
+    success_count: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    last_used_at: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    archived: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[str] = mapped_column(String(32), default=utc_now_iso, nullable=False)
     updated_at: Mapped[str] = mapped_column(
         String(32), default=utc_now_iso, onupdate=utc_now_iso, nullable=False
@@ -299,6 +343,7 @@ ENTITY_TYPES: tuple[type[Base], ...] = (
     Aim,
     Signal,
     QueuedJob,
+    WorkerPattern,
     FailedJob,
     ChainTemplate,
     ChainRun,

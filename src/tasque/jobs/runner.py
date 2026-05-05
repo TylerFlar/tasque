@@ -20,7 +20,9 @@ calls it after ``claim``-ing.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from typing import TYPE_CHECKING, Any, NotRequired, TypedDict, cast
 
 import structlog
@@ -34,7 +36,12 @@ from tasque.llm.factory import (
     get_chat_model_for_tier,
 )
 from tasque.memory.entities import Note, QueuedJob
-from tasque.memory.repo import write_entity
+from tasque.memory.repo import (
+    search_worker_patterns,
+    upsert_worker_pattern,
+    worker_pattern_keywords,
+    write_entity,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -106,6 +113,10 @@ your turn. Pass the bucket from the run context above on each call.
   trivial nudges, ``"medium"`` for multi-step tool / scrape /
   summarize work, ``"large"`` for agentic planning, code iteration,
   or deep creative generation.
+- **Worker patterns**: ``worker_pattern_search(intent, query, bucket,
+  limit)`` reads compact notes from prior successful worker runs.
+  Tasque may pre-inject relevant matches in your prompt; call this
+  only when you need a little more precedent for the directive.
 - **Chain templates**: ``chain_template_create``, ``chain_template_get``,
   ``chain_template_list``, ``chain_template_update``, ``chain_template_delete``.
 - **Chain runs**: ``chain_fire_template(name)`` to launch a saved
@@ -166,6 +177,7 @@ class WorkerState(TypedDict):
     result_token: str
     consumes: NotRequired[dict[str, Any]]
     vars: NotRequired[dict[str, Any]]
+    worker_patterns: NotRequired[list[dict[str, Any]]]
     llm: NotRequired[BaseChatModel | None]
     messages: NotRequired[list[BaseMessage]]
     raw_response: NotRequired[str]
@@ -190,17 +202,229 @@ def _format_vars(chain_vars: dict[str, Any] | None) -> str:
         return repr(chain_vars)
 
 
+_PATTERN_RETRIEVAL_LIMIT = 3
+_PATTERN_MAX_CONTENT_CHARS = 1_200
+_PATTERN_MAX_LINE_CHARS = 220
+_SECRET_SUBS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(
+            r"(?i)\b(api[_-]?key|authorization|cookie|password|secret|token)"
+            r"\s*[:=]\s*['\"]?[^'\"\s,;]+"
+        ),
+        r"\1=[redacted]",
+    ),
+    (re.compile(r"(?i)\bbearer\s+[a-z0-9._~+/-]+=*"), "Bearer [redacted]"),
+)
+_RAW_DUMP_MARKERS = (
+    "base64,",
+    "data:image",
+    "<!doctype",
+    "<html",
+    "raw browser",
+    "screenshot",
+)
+_GOTCHA_HINTS = (
+    "avoid",
+    "blocked",
+    "captcha",
+    "caution",
+    "failed",
+    "gotcha",
+    "important",
+    "login",
+    "modal",
+    "rate limit",
+    "retry",
+    "skip",
+    "stale",
+    "timeout",
+    "verify",
+    "watch",
+)
+
+
+def _compact_line(text: str, *, limit: int = _PATTERN_MAX_LINE_CHARS) -> str:
+    compact = " ".join(text.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3].rstrip() + "..."
+
+
+def _scrub_pattern_text(text: str) -> str:
+    scrubbed = text
+    for pattern, replacement in _SECRET_SUBS:
+        scrubbed = pattern.sub(replacement, scrubbed)
+    return scrubbed
+
+
+def _safe_report_gotchas(report: str, *, limit: int = 3) -> list[str]:
+    gotchas: list[str] = []
+    for raw_line in report.splitlines():
+        line = raw_line.strip().lstrip("-*0123456789. ")
+        if not line:
+            continue
+        lowered = line.lower()
+        if any(marker in lowered for marker in _RAW_DUMP_MARKERS):
+            continue
+        if not any(hint in lowered for hint in _GOTCHA_HINTS):
+            continue
+        gotchas.append(_compact_line(_scrub_pattern_text(line), limit=180))
+        if len(gotchas) >= limit:
+            break
+    return gotchas
+
+
+def _worker_pattern_key(directive: str, produces: dict[str, Any]) -> str:
+    produce_keys = sorted(str(k) for k in produces)[:12]
+    keywords = worker_pattern_keywords(
+        f"{directive} {' '.join(produce_keys)}",
+        limit=10,
+    )
+    basis = "|".join([*keywords, *produce_keys]) or directive
+    digest = hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
+    return f"worker:{digest}"
+
+
+def _build_worker_pattern_content(
+    *,
+    directive: str,
+    summary: str,
+    report: str,
+    produces: dict[str, Any],
+) -> tuple[str, list[str], dict[str, Any]]:
+    directive_summary = _compact_line(_scrub_pattern_text(directive), limit=260)
+    summary_text = _compact_line(_scrub_pattern_text(summary), limit=260)
+    produce_keys = sorted(str(k) for k in produces)[:12]
+    gotchas = _safe_report_gotchas(report)
+    tags = worker_pattern_keywords(
+        " ".join([directive_summary, summary_text, *produce_keys, *gotchas]),
+        limit=16,
+    )
+
+    lines = [
+        f"Directive: {directive_summary}",
+        f"Produces keys: {', '.join(produce_keys) if produce_keys else '(none)'}",
+        f"Summary: {summary_text}",
+        "Gotchas:",
+    ]
+    if gotchas:
+        lines.extend(f"- {g}" for g in gotchas)
+    else:
+        lines.append("- none noted")
+    content = "\n".join(lines)
+    if len(content) > _PATTERN_MAX_CONTENT_CHARS:
+        content = content[: _PATTERN_MAX_CONTENT_CHARS - 3].rstrip() + "..."
+    meta = {
+        "directive_summary": directive_summary,
+        "produces_keys": produce_keys,
+        "summary": summary_text,
+        "gotchas": gotchas,
+    }
+    return content, tags, meta
+
+
+def _serialize_worker_pattern_for_prompt(row: Any) -> dict[str, Any]:
+    return {
+        "bucket": getattr(row, "bucket", ""),
+        "source_kind": getattr(row, "source_kind", ""),
+        "key": getattr(row, "key", ""),
+        "content": getattr(row, "content", ""),
+        "tags": list(getattr(row, "tags", []) or []),
+        "success_count": int(getattr(row, "success_count", 0) or 0),
+        "last_used_at": getattr(row, "last_used_at", None),
+    }
+
+
+def _retrieve_worker_patterns(bucket: str | None, directive: str) -> list[dict[str, Any]]:
+    try:
+        rows = search_worker_patterns(
+            query=directive,
+            bucket=bucket or "",
+            limit=_PATTERN_RETRIEVAL_LIMIT,
+        )
+    except Exception as exc:
+        log.warning(
+            "jobs.runner.worker_pattern_search_failed",
+            bucket=bucket,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return []
+    return [_serialize_worker_pattern_for_prompt(row) for row in rows]
+
+
+def _format_worker_patterns(patterns: list[dict[str, Any]] | None) -> str:
+    if not patterns:
+        return ""
+    lines = [
+        "## Relevant Past Patterns",
+        "Compact notes from prior successful worker runs. Use only what fits.",
+    ]
+    for idx, pattern in enumerate(patterns, start=1):
+        bucket = str(pattern.get("bucket") or "global")
+        source_kind = str(pattern.get("source_kind") or "worker")
+        success_count = int(pattern.get("success_count") or 0)
+        header = f"{idx}. {bucket}/{source_kind}"
+        if success_count:
+            header += f" ({success_count} successful run"
+            header += "s" if success_count != 1 else ""
+            header += ")"
+        lines.append(header)
+        content = _compact_line(str(pattern.get("content") or ""), limit=700)
+        lines.append(content)
+    return "\n".join(lines)
+
+
+def _store_successful_worker_pattern(
+    state: WorkerState,
+    *,
+    summary: str,
+    report: str,
+    produces: dict[str, Any],
+) -> None:
+    try:
+        content, tags, meta = _build_worker_pattern_content(
+            directive=state["job_directive"],
+            summary=summary,
+            report=report,
+            produces=produces,
+        )
+        meta.update(
+            {
+                "job_id": state["job_id"],
+                "chain_id": state["job_chain_id"],
+                "chain_step_id": state["job_chain_step_id"],
+            }
+        )
+        upsert_worker_pattern(
+            bucket=state["job_bucket"],
+            source_kind="worker",
+            key=_worker_pattern_key(state["job_directive"], produces),
+            content=content,
+            tags=tags,
+            meta=meta,
+        )
+    except Exception as exc:
+        log.warning(
+            "jobs.runner.worker_pattern_write_failed",
+            job_id=state["job_id"],
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+
 def _build_prompt(state: WorkerState) -> dict[str, Any]:
     consumes = state.get("consumes") or {}
     chain_vars = state.get("vars") or {}
     bucket = state["job_bucket"] or "(no bucket)"
     reason = state["job_reason"] or "(no reason given)"
+    pattern_section = _format_worker_patterns(state.get("worker_patterns"))
+    pattern_text = f"{pattern_section}\n\n" if pattern_section else ""
     user_text = (
         "## Run context\n"
         f"- Bucket: {bucket}\n"
         f"- Reason: {reason}\n"
         f"- result_token: {state['result_token']}  "
         "(pass this to submit_worker_result)\n\n"
+        f"{pattern_text}"
         f"Directive:\n{state['job_directive']}\n\n"
         f"Consumes (from previous chain step, if any):\n{_format_consumes(consumes)}\n\n"
         f"Vars (run-time overrides supplied at chain launch):\n{_format_vars(chain_vars)}\n\n"
@@ -381,6 +605,13 @@ def _persist_run(state: WorkerState) -> dict[str, Any]:
         },
     )
     write_entity(note)
+    if error_value is None:
+        _store_successful_worker_pattern(
+            state,
+            summary=summary_v,
+            report=report_v,
+            produces=produces_d,
+        )
     return {
         "result": WorkerResult(
             report=report_v,
@@ -461,6 +692,7 @@ def run_worker(
         "result_token": result_inbox.mint_token(),
         "consumes": consumes or {},
         "vars": vars or {},
+        "worker_patterns": _retrieve_worker_patterns(job.bucket, job.directive),
         "llm": llm,
     }
     final = graph.invoke(initial)

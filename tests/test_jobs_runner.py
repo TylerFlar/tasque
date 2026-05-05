@@ -10,7 +10,7 @@ from sqlalchemy import select
 
 from tasque.jobs.runner import run_worker
 from tasque.memory.db import get_session
-from tasque.memory.entities import Note, QueuedJob
+from tasque.memory.entities import Note, QueuedJob, WorkerPattern
 from tasque.memory.repo import write_entity
 
 from .conftest import make_worker_result_chat_model
@@ -114,10 +114,120 @@ def test_run_worker_threads_consumes_into_prompt() -> None:
 
     result = run_worker(job, consumes={"prev_step_output": "abc"}, llm=fake)
     assert result["error"] is None
+    system_text = str(captured["messages"][0].content)
+    assert "MCP tool discovery" not in system_text
+    assert "rg -uuu" not in system_text
     user_text = str(captured["messages"][1].content)
     assert "prev_step_output" in user_text
     assert "abc" in user_text
     assert "result_token" in user_text
+
+
+def test_run_worker_injects_relevant_past_patterns() -> None:
+    write_entity(
+        WorkerPattern(
+            bucket="finance",
+            source_kind="worker",
+            key="worker:stripe-invoice",
+            content=(
+                "Directive: reconcile Stripe invoice exports\n"
+                "Produces keys: invoice_ids\n"
+                "Summary: Check Stripe before the ledger export."
+            ),
+            tags=["stripe", "invoice", "ledger"],
+            success_count=3,
+        )
+    )
+    write_entity(
+        WorkerPattern(
+            bucket="career",
+            source_kind="worker",
+            key="worker:unrelated",
+            content="Directive: update resume bullets",
+            tags=["resume"],
+        )
+    )
+    job = _make_job(
+        directive="Reconcile the Stripe invoice export and produce invoice_ids",
+        bucket="finance",
+    )
+    captured: dict[str, Any] = {}
+    fake = make_worker_result_chat_model(
+        [{"report": "ok", "summary": "ok", "produces": {}}]
+    )
+    original_generate = fake._generate
+
+    def _capture(messages: list[Any], *args: Any, **kwargs: Any) -> Any:
+        captured["messages"] = messages
+        return original_generate(messages, *args, **kwargs)
+
+    fake._generate = _capture  # type: ignore[method-assign]
+
+    result = run_worker(job, llm=fake)
+
+    assert result["error"] is None
+    user_text = str(captured["messages"][1].content)
+    assert "## Relevant Past Patterns" in user_text
+    assert "Check Stripe before the ledger export" in user_text
+    assert "update resume bullets" not in user_text
+
+
+def test_run_worker_writes_compact_pattern_after_success() -> None:
+    job = _make_job(
+        directive="Summarize pantry restock and return grocery_ids",
+        bucket="home",
+    )
+    fake = make_worker_result_chat_model(
+        [
+            {
+                "report": (
+                    "Reviewed the pantry list.\n"
+                    "Gotcha: Instacart hides unavailable replacements.\n"
+                    "password=super-secret"
+                ),
+                "summary": "Pantry restock summary is ready.",
+                "produces": {"grocery_ids": ["g-1", "g-2"]},
+            }
+        ]
+    )
+
+    result = run_worker(job, llm=fake)
+
+    assert result["error"] is None
+    with get_session() as sess:
+        patterns = list(sess.execute(select(WorkerPattern)).scalars().all())
+    assert len(patterns) == 1
+    pattern = patterns[0]
+    assert pattern.bucket == "home"
+    assert pattern.source_kind == "worker"
+    assert pattern.success_count == 1
+    assert "Summarize pantry restock" in pattern.content
+    assert "grocery_ids" in pattern.content
+    assert "Pantry restock summary is ready" in pattern.content
+    assert "Instacart hides unavailable replacements" in pattern.content
+    assert "super-secret" not in pattern.content
+    assert pattern.meta["produces_keys"] == ["grocery_ids"]
+
+
+def test_run_worker_does_not_write_pattern_after_application_error() -> None:
+    job = _make_job(directive="attempt blocked task", bucket="personal")
+    fake = make_worker_result_chat_model(
+        [
+            {
+                "report": "blocked",
+                "summary": "blocked",
+                "produces": {},
+                "error": "external tool failed",
+            }
+        ]
+    )
+
+    result = run_worker(job, llm=fake)
+
+    assert result["error"] == "external tool failed"
+    with get_session() as sess:
+        patterns = list(sess.execute(select(WorkerPattern)).scalars().all())
+    assert patterns == []
 
 
 def test_run_worker_accepts_missing_produces() -> None:

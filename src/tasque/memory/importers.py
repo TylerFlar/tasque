@@ -23,6 +23,7 @@ from tasque.memory.entities import ENTITY_BY_NAME, Note
 # (because ``metadata`` is reserved on SQLAlchemy DeclarativeBase).
 _FIELD_RENAMES: dict[str, dict[str, str]] = {
     "Note": {"metadata": "meta"},
+    "WorkerPattern": {"metadata": "meta"},
 }
 
 

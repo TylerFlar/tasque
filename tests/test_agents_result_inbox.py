@@ -258,6 +258,25 @@ def test_submit_planner_result_defaults_to_empty_list() -> None:
     assert payload == {"mutations": []}
 
 
+# ------------------------------------ submit_aim_chain_plan_result tool
+
+
+def test_submit_aim_chain_plan_result_writes_inbox_row() -> None:
+    tool = _get_tool("submit_aim_chain_plan_result")
+    token = result_inbox.mint_token()
+    plan = {
+        "chain_name": "demo",
+        "bucket": "personal",
+        "recurrence": None,
+        "planner_tier": "large",
+        "plan": [{"id": "a", "directive": "do A", "tier": "small"}],
+    }
+    out = _call_tool(tool, result_token=token, plan=plan)
+    assert json.loads(out) == {"ok": True}
+    payload = result_inbox.read_and_consume(token, agent_kind="aim_chain_plan")
+    assert payload == {"plan": plan}
+
+
 # ------------------------------------ submit_strategist_result tool
 
 

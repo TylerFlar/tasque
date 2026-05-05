@@ -23,11 +23,13 @@ from tasque.memory.entities import (
     Note,
     QueuedJob,
     Signal,
+    WorkerPattern,
 )
 
 # Per-class Python-attribute → JSON-key renames (inverse of importer).
 _FIELD_RENAMES: dict[str, dict[str, str]] = {
     "Note": {"meta": "metadata"},
+    "WorkerPattern": {"meta": "metadata"},
 }
 
 # Order entities are written in — keep stable so test assertions are stable.
@@ -36,6 +38,7 @@ _EXPORT_ORDER: tuple[type[Base], ...] = (
     Aim,
     Signal,
     QueuedJob,
+    WorkerPattern,
     FailedJob,
     ChainTemplate,
     ChainRun,

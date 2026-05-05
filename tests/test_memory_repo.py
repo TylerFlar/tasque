@@ -4,7 +4,15 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from tasque.memory.entities import Aim, Attachment, FailedJob, Note, QueuedJob, Signal
+from tasque.memory.entities import (
+    Aim,
+    Attachment,
+    FailedJob,
+    Note,
+    QueuedJob,
+    Signal,
+    WorkerPattern,
+)
 from tasque.memory.repo import (
     archive,
     bump_job_heartbeat,
@@ -15,8 +23,10 @@ from tasque.memory.repo import (
     query_pending_jobs,
     query_signals_for,
     query_unresolved_failures,
+    search_worker_patterns,
     supersede_note,
     update_entity_status,
+    upsert_worker_pattern,
     write_entity,
 )
 
@@ -271,6 +281,55 @@ def test_archive_attachment() -> None:
     fetched = get_entity(att.id)
     assert isinstance(fetched, Attachment)
     assert fetched.archived is True
+
+
+def test_worker_pattern_search_and_upsert() -> None:
+    first = upsert_worker_pattern(
+        bucket="finance",
+        source_kind="worker",
+        key="worker:rebalance-review",
+        content="Directive: review rebalance gates\nSummary: Checked target weights.",
+        tags=["rebalance", "weights"],
+        meta={"produces_keys": ["proposal_id"]},
+    )
+    second = upsert_worker_pattern(
+        bucket="finance",
+        source_kind="worker",
+        key="worker:rebalance-review",
+        content="Directive: review rebalance gates\nSummary: Checked newer target weights.",
+        tags=["rebalance", "weights"],
+        meta={"produces_keys": ["proposal_id"]},
+    )
+
+    assert second.id == first.id
+    assert second.success_count == 2
+
+    rows = search_worker_patterns(
+        query="rebalance target weights",
+        bucket="finance",
+        limit=5,
+        touch=False,
+    )
+    assert [r.id for r in rows] == [first.id]
+    assert rows[0].content.endswith("newer target weights.")
+
+    assert search_worker_patterns(
+        query="rebalance target weights",
+        bucket="career",
+        limit=5,
+        touch=False,
+    ) == []
+
+    assert archive(first.id) is True
+    fetched = get_entity(first.id)
+    assert isinstance(fetched, WorkerPattern)
+    assert fetched.archived is True
+    assert search_worker_patterns(
+        query="rebalance target weights",
+        bucket="finance",
+        limit=5,
+        touch=False,
+    ) == []
 
 
 def test_aim_status_update() -> None:

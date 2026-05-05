@@ -3,6 +3,11 @@ that callers should touch."""
 
 from __future__ import annotations
 
+import json
+import re
+from collections.abc import Sequence
+from typing import Any
+
 from sqlalchemy import select
 
 from tasque.memory.db import get_session
@@ -16,6 +21,7 @@ from tasque.memory.entities import (
     Note,
     QueuedJob,
     Signal,
+    WorkerPattern,
     utc_now_iso,
 )
 
@@ -24,6 +30,7 @@ Entity = (
     | Aim
     | Signal
     | QueuedJob
+    | WorkerPattern
     | FailedJob
     | ChainTemplate
     | ChainRun
@@ -36,6 +43,7 @@ _ALL_TYPES: tuple[type[Base], ...] = (
     Aim,
     Signal,
     QueuedJob,
+    WorkerPattern,
     FailedJob,
     ChainTemplate,
     ChainRun,
@@ -47,10 +55,53 @@ _BUCKETED_TYPES: tuple[type[Base], ...] = (
     Note,
     Aim,
     QueuedJob,
+    WorkerPattern,
     FailedJob,
     ChainTemplate,
     ChainRun,
     Attachment,
+)
+
+_WORKER_PATTERN_WORD_RE = re.compile(r"[a-z0-9][a-z0-9_./-]{2,}", re.IGNORECASE)
+_WORKER_PATTERN_STOPWORDS: frozenset[str] = frozenset(
+    {
+        "about",
+        "after",
+        "again",
+        "also",
+        "and",
+        "are",
+        "bucket",
+        "but",
+        "can",
+        "did",
+        "directive",
+        "done",
+        "for",
+        "from",
+        "has",
+        "have",
+        "into",
+        "its",
+        "job",
+        "now",
+        "once",
+        "only",
+        "run",
+        "step",
+        "that",
+        "the",
+        "this",
+        "through",
+        "use",
+        "using",
+        "was",
+        "when",
+        "with",
+        "worker",
+        "you",
+        "your",
+    }
 )
 
 
@@ -117,9 +168,9 @@ def update_entity_status(id: str, status: str) -> bool:
 
 
 def archive(id: str) -> bool:
-    """Set ``archived=True`` on a Note, Signal, or Attachment."""
+    """Set ``archived=True`` on a Note, Signal, Attachment, or WorkerPattern."""
     with get_session() as sess:
-        for cls in (Note, Signal, Attachment):
+        for cls in (Note, Signal, Attachment, WorkerPattern):
             obj = sess.get(cls, id)
             if obj is not None:
                 obj.archived = True
@@ -199,6 +250,159 @@ def query_unresolved_failures(limit: int = 20) -> list[FailedJob]:
         return rows
 
 
+def worker_pattern_keywords(text: str, *, limit: int = 16) -> list[str]:
+    """Extract stable keyword tokens for simple worker-pattern matching."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for match in _WORKER_PATTERN_WORD_RE.finditer(text.lower()):
+        token = match.group(0).strip("_./-")
+        if (
+            len(token) < 3
+            or token in _WORKER_PATTERN_STOPWORDS
+            or token.isdigit()
+            or token in seen
+        ):
+            continue
+        seen.add(token)
+        out.append(token)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _json_search_text(value: object) -> str:
+    try:
+        return json.dumps(value, sort_keys=True, default=str).lower()
+    except (TypeError, ValueError):
+        return str(value).lower()
+
+
+def _score_worker_pattern(row: WorkerPattern, tokens: Sequence[str]) -> int:
+    key_text = (row.key or "").lower()
+    content_text = (row.content or "").lower()
+    tags_text = " ".join(str(t).lower() for t in (row.tags or []))
+    meta_text = _json_search_text(row.meta or {})
+    score = 0
+    for token in tokens:
+        if token in key_text:
+            score += 4
+        if token in tags_text:
+            score += 3
+        if token in content_text:
+            score += 2
+        if token in meta_text:
+            score += 1
+    return score
+
+
+def search_worker_patterns(
+    *,
+    query: str,
+    bucket: str = "",
+    limit: int = 5,
+    touch: bool = True,
+) -> list[WorkerPattern]:
+    """Keyword search over active WorkerPattern rows.
+
+    ``bucket=""`` searches across buckets. When ``touch=True``, selected
+    rows have ``last_used_at`` updated so pattern use is auditable.
+    """
+    if limit < 1 or not query.strip():
+        return []
+    tokens = worker_pattern_keywords(query, limit=24)
+    if not tokens:
+        return []
+    bucket_value = bucket.strip()
+    with get_session() as sess:
+        stmt = select(WorkerPattern).where(WorkerPattern.archived.is_(False))
+        if bucket_value:
+            stmt = stmt.where(WorkerPattern.bucket == bucket_value)
+        rows = list(
+            sess.execute(
+                stmt.order_by(WorkerPattern.updated_at.desc()).limit(250)
+            )
+            .scalars()
+            .all()
+        )
+        scored: list[tuple[int, int, str, WorkerPattern]] = []
+        for row in rows:
+            score = _score_worker_pattern(row, tokens)
+            if score > 0:
+                scored.append((score, row.success_count, row.updated_at, row))
+        scored.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+        selected = [item[3] for item in scored[:limit]]
+        if touch and selected:
+            now = utc_now_iso()
+            for row in selected:
+                row.last_used_at = now
+                row.updated_at = now
+            sess.flush()
+        for row in selected:
+            sess.expunge(row)
+        return selected
+
+
+def upsert_worker_pattern(
+    *,
+    bucket: str | None,
+    source_kind: str,
+    key: str,
+    content: str,
+    tags: Sequence[str] | None = None,
+    meta: dict[str, Any] | None = None,
+) -> WorkerPattern:
+    """Insert or update a compact successful-run WorkerPattern."""
+    bucket_value = (bucket or "").strip()
+    source_value = source_kind.strip()
+    key_value = key.strip()
+    content_value = content.strip()
+    if not source_value:
+        raise ValueError("source_kind must be non-empty")
+    if not key_value:
+        raise ValueError("key must be non-empty")
+    if not content_value:
+        raise ValueError("content must be non-empty")
+    tags_value: list[str] = []
+    seen: set[str] = set()
+    for tag in tags or ():
+        tag_value = str(tag).strip().lower()
+        if not tag_value or tag_value in seen:
+            continue
+        seen.add(tag_value)
+        tags_value.append(tag_value)
+
+    with get_session() as sess:
+        stmt = (
+            select(WorkerPattern)
+            .where(WorkerPattern.bucket == bucket_value)
+            .where(WorkerPattern.source_kind == source_value)
+            .where(WorkerPattern.key == key_value)
+        )
+        row = sess.execute(stmt).scalars().first()
+        now = utc_now_iso()
+        if row is None:
+            row = WorkerPattern(
+                bucket=bucket_value,
+                source_kind=source_value,
+                key=key_value,
+                content=content_value,
+                tags=tags_value,
+                meta=meta or {},
+                success_count=1,
+            )
+            sess.add(row)
+        else:
+            row.content = content_value
+            row.tags = tags_value
+            row.meta = meta or {}
+            row.success_count += 1
+            row.archived = False
+            row.updated_at = now
+        sess.flush()
+        sess.expunge(row)
+        return row
+
+
 def bump_job_heartbeat(id: str, iso: str) -> bool:
     """Set ``last_heartbeat`` on a QueuedJob to ``iso``."""
     with get_session() as sess:
@@ -259,8 +463,11 @@ __all__ = [
     "query_pending_jobs",
     "query_signals_for",
     "query_unresolved_failures",
+    "search_worker_patterns",
     "supersede_note",
     "sweep_nondurable_memory",
     "update_entity_status",
+    "upsert_worker_pattern",
+    "worker_pattern_keywords",
     "write_entity",
 ]

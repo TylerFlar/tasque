@@ -54,6 +54,14 @@ def test_create_chain_template_persists_row() -> None:
     assert row["enabled"] is True
 
 
+def test_create_chain_template_can_start_disabled() -> None:
+    name = create_chain_template(_spec(), enabled=False)
+    assert name == "demo"
+    row = get_chain_template("demo")
+    assert row is not None
+    assert row["enabled"] is False
+
+
 def test_create_chain_template_rejects_mirror_mismatch_for_recurrence() -> None:
     spec = _spec(recurrence="0 9 * * MON-FRI")
     with pytest.raises(MirrorMismatch):

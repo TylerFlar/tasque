@@ -292,6 +292,7 @@ def _claim_next_runnable_chain(
     owner_id: str,
     lease_seconds: float = DEFAULT_CHAIN_LEASE_SECONDS,
     now: datetime | None = None,
+    exclude_chain_ids: set[str] | None = None,
 ) -> ChainRun | None:
     """Atomically claim one unowned or expired running chain for this daemon."""
     reference = now if now is not None else datetime.now(UTC)
@@ -316,6 +317,10 @@ def _claim_next_runnable_chain(
             .order_by(ChainRun.created_at.asc())
             .limit(10)
         )
+        if exclude_chain_ids:
+            candidate_stmt = candidate_stmt.where(
+                ChainRun.chain_id.not_in(sorted(exclude_chain_ids))
+            )
         candidates = list(sess.execute(candidate_stmt).scalars().all())
         for candidate in candidates:
             if _is_invoke_active(candidate.chain_id):
@@ -542,13 +547,16 @@ def claim_and_run_ready_chains(
         return []
     actual_owner = owner_id or f"daemon-{uuid4().hex[:12]}"
     ran: list[str] = []
+    attempted_chain_ids: set[str] = set()
     for _ in range(max_runs):
         row = _claim_next_runnable_chain(
             owner_id=actual_owner,
             lease_seconds=lease_seconds,
+            exclude_chain_ids=attempted_chain_ids,
         )
         if row is None:
             break
+        attempted_chain_ids.add(row.chain_id)
         log.info(
             "chains.scheduler.claimed",
             chain_id=row.chain_id[:8],

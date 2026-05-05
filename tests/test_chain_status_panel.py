@@ -658,6 +658,104 @@ async def test_watcher_delays_stopped_terminal_while_invoke_active(
 
 
 @pytest.mark.asyncio
+async def test_watcher_posts_status_for_fast_active_self_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A chain can stop itself before the status watcher has posted the
+    first live panel. The chains-channel status message should still
+    appear immediately, while the rich terminal report waits for the
+    active invoke to finish writing its checkpoint.
+    """
+    threads.set_thread_id(threads.PURPOSE_JOBS, 4242)
+
+    fake = _FakePoster()
+    poster.set_client(fake)  # type: ignore[arg-type]
+
+    active = {"value": True}
+    monkeypatch.setattr(
+        chain_status_watcher,
+        "_chain_invoke_active",
+        lambda _chain_id: active["value"],
+    )
+
+    from tasque.memory.entities import ChainRun as ChainRunEntity
+    from tasque.memory.entities import utc_now_iso
+
+    chain_id = "cidfastselfstop0"
+    now = utc_now_iso()
+    with get_session() as sess:
+        sess.add(
+            ChainRunEntity(
+                id="row" + chain_id[:8],
+                chain_id=chain_id,
+                chain_name="fast-stop-demo",
+                bucket="education",
+                status="stopped",
+                started_at=now,
+                ended_at=now,
+            )
+        )
+
+    def _chains_posts() -> list[dict[str, Any]]:
+        return [
+            embed
+            for (channel_id, embed, _v) in fake.embeds_posted
+            if channel_id == _TEST_CHAINS_CHANNEL_ID
+        ]
+
+    def _jobs_posts() -> list[dict[str, Any]]:
+        return [
+            embed
+            for (channel_id, embed, _v) in fake.embeds_posted
+            if channel_id == 4242
+        ]
+
+    last_signatures: dict[str, str] = {}
+    notified_terminal: set[str] = set()
+
+    await chain_status_watcher._tick(
+        last_signatures=last_signatures,
+        notified_terminal=notified_terminal,
+    )
+
+    chains_posts = _chains_posts()
+    assert len(chains_posts) == 1
+    assert "stopped" in chains_posts[0]["title"]
+    assert _jobs_posts() == []
+    assert chain_id in last_signatures
+
+    with get_session() as sess:
+        row = sess.execute(
+            ChainRunEntity.__table__.select().where(
+                ChainRunEntity.chain_id == chain_id
+            )
+        ).mappings().first()
+        assert row is not None
+        assert row["status_message_id"] is not None
+        assert row["terminal_notified_at"] is None
+
+    active["value"] = False
+    await chain_status_watcher._tick(
+        last_signatures=last_signatures,
+        notified_terminal=notified_terminal,
+    )
+
+    jobs_posts = _jobs_posts()
+    assert len(jobs_posts) == 1
+    assert "Chain stopped" in jobs_posts[0]["title"]
+
+    with get_session() as sess:
+        row = sess.execute(
+            ChainRunEntity.__table__.select().where(
+                ChainRunEntity.chain_id == chain_id
+            )
+        ).mappings().first()
+        assert row is not None
+        assert row["terminal_notified_at"] is not None
+        assert row["status_message_id"] is None
+
+
+@pytest.mark.asyncio
 async def test_watcher_skips_terminal_chain_with_stale_message_id() -> None:
     """Daemon restart after long downtime: a terminal chain's cached
     message id is now too old to edit. The watcher must NOT post a

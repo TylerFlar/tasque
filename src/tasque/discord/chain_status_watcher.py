@@ -286,32 +286,24 @@ async def _tick(
     seen_ids: set[str] = set()
     for chain_run in rows:
         seen_ids.add(chain_run.chain_id)
+        stopped_invoke_active = (
+            chain_run.status == "stopped"
+            and _chain_invoke_active(chain_run.chain_id)
+        )
 
         # Don't retroactively post for chains that already finished WITHOUT
         # ever having a live status message. Those completed (or failed,
         # or got stopped) before the chain status panel feature existed,
         # or before the watcher caught up — surfacing them now would be
         # noise, not signal. They stay in the audit trail (chain_runs
-        # row, checkpoints) but never get a Discord embed.
+        # row, checkpoints) but never get a Discord embed. The active
+        # self-stop exception below keeps fast cooperative stops visible
+        # while their graph invoke finishes writing the final checkpoint.
         if (
             chain_run.status in ("completed", "failed", "stopped")
             and chain_run.status_message_id is None
+            and not stopped_invoke_active
         ):
-            continue
-
-        if chain_run.status == "stopped" and _chain_invoke_active(
-            chain_run.chain_id
-        ):
-            # ``chain_run_stop`` is cooperative: it records the stop
-            # request while any already-dispatched worker finishes. Wait
-            # until the active graph invoke exits before posting the
-            # one-shot terminal thread, otherwise self-stopping workers
-            # can produce an empty "stopped" report and then continue to
-            # write the useful final checkpoint milliseconds later.
-            log.debug(
-                "discord.chain_status.stopped_active_wait",
-                chain_id=chain_run.chain_id[:8],
-            )
             continue
 
         state = _load_state(chain_run.chain_id)
@@ -320,33 +312,44 @@ async def _tick(
         )
         embed = build_chain_status_embed(snapshot)
         sig = _signature(embed)
+        terminal = is_terminal_run(snapshot)
 
         prev_sig = last_signatures.get(chain_run.chain_id)
-        if (
-            prev_sig == sig
-            and chain_run.status_message_id is not None
-        ):
-            # Nothing meaningful changed AND there's already a posted
-            # message — skip the live-panel edit. Terminal notification
-            # uses ChainRun.terminal_notified_at for de-dup, so it can't
-            # be skipped by this short-circuit either way.
-            continue
-
-        # If the chain is terminal AND we've already done one edit at
-        # this terminal signature, leave it alone forever. The signature
-        # check above handles "one edit and stop" naturally because the
-        # terminal embed's signature is stable.
-        result = await _post_or_edit(
-            chain_run=chain_run,
-            embed=embed,
-            run_status=snapshot["run_status"],
+        should_write = (
+            prev_sig != sig
+            or chain_run.status_message_id is None
         )
-        if result is None:
+        if not should_write and not terminal:
+            # Nothing meaningful changed and there's already a posted
+            # message.
             continue
-        last_signatures[chain_run.chain_id] = sig
-        written += 1
 
-        if is_terminal_run(snapshot):
+        if should_write:
+            result = await _post_or_edit(
+                chain_run=chain_run,
+                embed=embed,
+                run_status=snapshot["run_status"],
+            )
+            if result is None:
+                continue
+            last_signatures[chain_run.chain_id] = sig
+            written += 1
+
+        if terminal:
+            if stopped_invoke_active:
+                # ``chain_run_stop`` is cooperative: it records the stop
+                # request while any already-dispatched worker finishes.
+                # Keep the live status panel current, but wait until the
+                # active graph invoke exits before posting the one-shot
+                # terminal thread. Otherwise self-stopping workers can
+                # produce an empty "stopped" report and then continue to
+                # write the useful final checkpoint milliseconds later.
+                log.debug(
+                    "discord.chain_status.stopped_active_wait",
+                    chain_id=chain_run.chain_id[:8],
+                )
+                continue
+
             log.debug(
                 "discord.chain_status.terminal_finalized",
                 chain_id=chain_run.chain_id,

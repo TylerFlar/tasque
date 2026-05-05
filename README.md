@@ -15,8 +15,9 @@ via Claude or Codex MCP config; the daemon's LLM calls go through
 endpoint. tasque also ships **its own MCP**
 (`tasque mcp`) you register the same way — that gives every coach,
 worker, and strategist run a live tool catalog for the daemon's own
-state (notes, queued jobs, chain templates, chain runs, signals). Memory
-is SQLite via SQLAlchemy. Job scheduling is APScheduler. Multi-step
+state (notes, queued jobs, chain templates, chain runs, signals, aims,
+worker patterns). Memory is SQLite via SQLAlchemy. Job scheduling is
+APScheduler. Multi-step
 workflows ("chains") are LangGraph with the SQLite checkpointer. One
 process, one venv, no Docker.
 
@@ -146,6 +147,10 @@ Knobs:
   set. Defaults to the tasque project root.
 - Codex runs with full filesystem access and no approval prompts via
   `--dangerously-bypass-approvals-and-sandbox`; the proxy is unattended.
+- Codex proxy turns inject the local `tasque` MCP server and, when
+  `mcps/trading-mcp/` exists, `trading-mcp` through Codex `-c` config
+  overrides. This keeps result-submission tools and the trading tool
+  surface available even when a user-level Codex config is stale.
 
 Endpoints: `POST /v1/chat/completions`, `GET /healthz` (200 when
 the selected upstream's `--version` succeeds, 503 otherwise; cached 30 s),
@@ -155,11 +160,12 @@ per-request view with elapsed and idle state).
 ## tasque MCP
 
 `tasque mcp` is a stdio MCP server that exposes the daemon's own state
-(notes, queued jobs, chain templates, chain runs, signals) as live
-tools. Registering it in your host MCP config puts those tools in front of
-every LLM call routed through the proxy — so the reactive bucket coach,
-the chain worker, the planner, and the strategist can all fire chains,
-queue jobs, edit templates, and write notes mid-turn. Without it,
+(notes, queued jobs, chain templates, chain runs, signals, aims, worker
+patterns) as live tools. Registering it in your host MCP config puts
+those tools in front of every LLM call routed through the proxy — so the
+reactive bucket coach, the chain worker, the planner, and the strategist
+can all fire chains, queue jobs, edit templates, and write notes
+mid-turn. Without it,
 those agents have to encode every action in trailing JSON, which
 collapses for any "do this *now* and observe the result before
 continuing" need.
@@ -200,6 +206,8 @@ will list them):
   `note_archive`.
 - **Queued jobs** — `job_create`, `job_get`, `job_update`, `job_cancel`,
   `job_list`. Both one-shot and recurring (5-field cron, alias DOW).
+- **Worker patterns** — `worker_pattern_search` for compact
+  successful-run precedent.
 - **Chain templates** — `chain_template_create`, `chain_template_get`,
   `chain_template_list`, `chain_template_update`, `chain_template_delete`.
 - **Chain runs** — `chain_fire_template`, `chain_queue_adhoc`,
@@ -207,17 +215,19 @@ will list them):
   `chain_run_resume`, `chain_run_stop`.
 - **Signals** — `signal_create`, `signal_list`, `signal_archive`.
 - **Aims** — `aim_create`, `aim_get`, `aim_update`, `aim_list`
-  (strategist owns Aim writes; bucket coaches typically only read).
+  (strategist owns Aim writes; bucket coaches typically only read),
+  `aim_plan_chain`.
 - **Agent result submission** — `submit_worker_result`,
   `submit_coach_result`, `submit_planner_result`,
-  `submit_strategist_result`. Each agent (worker / bucket coach /
-  chain planner / strategist monitoring) ends its turn by calling its
-  matching tool with a `result_token` from the run context. The tool
-  drops the structured payload into a transient SQLite inbox; the
-  Python-side runner reads-and-deletes by token. This replaces
-  post-hoc JSON parsing of the model's text response — if the agent
-  forgets to call its tool, the run is recorded as a failure. The
-  worker runner gives the LLM one follow-up nudge before failing
+  `submit_aim_chain_plan_result`, `submit_strategist_result`. Each
+  agent (worker / bucket coach / chain planner / Aim-to-chain planner /
+  strategist monitoring) ends its turn by calling its matching tool
+  with a `result_token` from the run context. The tool drops the
+  structured payload into a transient SQLite inbox; the Python-side
+  runner reads-and-deletes by token. This replaces post-hoc JSON
+  parsing of the model's text response — if the agent forgets to call
+  its tool, the run is recorded as a failure. The worker runner gives
+  the LLM one follow-up nudge before failing
   (the small tier in particular sometimes finishes its turn with
   prose only); the reminder tells the model not to redo MCP side
   effects so the retry doesn't double-write notes or duplicate
@@ -240,11 +250,22 @@ With the MCP registered:
 
 ```bash
 # In Claude Code or any MCP-aware host, you should see "tasque" listed
-# alongside your other MCPs and ~38 tools available. From inside a model
+# alongside your other MCPs and ~41 tools available. From inside a model
 # turn:
 #   chain_template_list()                          → JSON array of templates
 #   note_create(content="hello", bucket="personal") → {"ok": true, "id": "..."}
 ```
+
+### Worker patterns
+
+Successful worker runs write compact `WorkerPattern` rows: directive
+summary, produced keys, completion summary, and scrubbed gotchas from
+the report. Future worker runs automatically retrieve up to three
+bucket-scoped keyword matches and inject them into the prompt as
+`Relevant Past Patterns`; MCP hosts can call
+`worker_pattern_search(intent, query, bucket, limit)` for the same
+recall. Patterns are exported/imported with the rest of memory and show
+up in `tasque memory stats`.
 
 ### Proxy smoke test
 
@@ -328,6 +349,13 @@ surfaces:
   Aim statuses). Wire it in via a chain step whose `directive` is the
   sentinel `[strategist:monitor]`; the worker dispatcher routes that
   to the monitoring graph instead of an LLM call.
+- **Aim-to-chain planning** — from MCP, call `aim_plan_chain(aim_id,
+  mode="adhoc"|"template")`. It asks the planner tier for a validated
+  first-pass chain spec, attaches `vars.aim_id` and `vars.aim_title`,
+  then queues an ad-hoc run or saves a template. Template mode defaults
+  to disabled unless `enabled=True` is passed. Ad-hoc mode dedups
+  active or recently terminal runs for the same Aim/name; override the
+  30-minute window with `TASQUE_AIM_CHAIN_DEDUP_SECONDS`.
 
 The strategist uses the `large` tier by default, same resolution rules as
 coaches (`TASQUE_MODEL_STRATEGIST` → `TASQUE_MODEL_LARGE`).

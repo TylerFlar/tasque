@@ -371,6 +371,44 @@ def test_build_codex_argv_uses_exec_json_and_stdin(tmp_path: Path) -> None:
     assert argv[-1] == "-"
 
 
+def test_build_codex_argv_can_inject_required_mcp_servers(tmp_path: Path) -> None:
+    argv = proxy_server._build_codex_argv(
+        exe="/fake/bin/codex",
+        model="gpt-5.4-mini",
+        cwd=tmp_path,
+        mcp_servers={
+            "trading-mcp": {
+                "command": "uv",
+                "args": [
+                    "run",
+                    "--project",
+                    "G:/tasque/mcps/trading-mcp",
+                    "trading-mcp-server",
+                ],
+            },
+            "tasque": {
+                "command": "uv",
+                "args": ["run", "--directory", "G:/tasque", "tasque", "mcp"],
+            },
+        },
+    )
+
+    overrides = [
+        argv[idx + 1] for idx, value in enumerate(argv) if value == "-c"
+    ]
+    assert 'mcp_servers.tasque.command="uv"' in overrides
+    assert 'mcp_servers.trading-mcp.command="uv"' in overrides
+    assert any(
+        override.startswith("mcp_servers.tasque.args=") and "tasque" in override
+        for override in overrides
+    )
+    assert any(
+        override.startswith("mcp_servers.trading-mcp.args=")
+        and "trading-mcp-server" in override
+        for override in overrides
+    )
+
+
 def test_resolve_upstream_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TASQUE_PROXY_UPSTREAM", "codex")
     assert proxy_server._env_upstream() == "codex"
@@ -488,6 +526,8 @@ def test_chat_completions_can_use_codex_upstream(
     }
     argv = captured["argv"]
     assert argv[:2] == ["/fake/bin/codex", "exec"]
+    assert 'mcp_servers.tasque.command="uv"' in argv
+    assert 'mcp_servers.trading-mcp.command="uv"' in argv
     assert "--json" in argv
     assert "--output-last-message" not in argv
     assert argv[-1] == "-"
