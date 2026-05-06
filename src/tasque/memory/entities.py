@@ -51,6 +51,12 @@ class Note(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     bucket: Mapped[str | None] = mapped_column(String(64), nullable=True)
     durability: Mapped[str] = mapped_column(String(16), nullable=False)
+    # Lifecycle is the newer, more precise memory contract. ``durability``
+    # stays for backward compatibility and broad read filters; these fields
+    # decide whether a note is curated memory or short-lived working residue.
+    memory_kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    ttl_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    canonical_key: Mapped[str | None] = mapped_column(String(256), nullable=True)
     source: Mapped[str] = mapped_column(String(32), nullable=False)
     archived: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     superseded_by: Mapped[str | None] = mapped_column(String(32), nullable=True)
@@ -338,6 +344,77 @@ class Attachment(Base):
 
 
 # Public registry of all entity types — used by repo, importer, exporter.
+class Intent(Base):
+    """Goal primitive for work that should keep shaping future action."""
+
+    __tablename__ = "intents"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_uuid)
+    title: Mapped[str] = mapped_column(String(256), nullable=False)
+    bucket: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    scope: Mapped[str] = mapped_column(String(16), default="goal", nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="active", nullable=False)
+    target_date: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    parent_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="user")
+    legacy_aim_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    meta: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSON, default=_empty_dict, nullable=False
+    )
+    created_at: Mapped[str] = mapped_column(String(32), default=utc_now_iso, nullable=False)
+    updated_at: Mapped[str] = mapped_column(
+        String(32), default=utc_now_iso, onupdate=utc_now_iso, nullable=False
+    )
+
+
+class ContextItem(Base):
+    """Curated memory that should influence future action."""
+
+    __tablename__ = "context_items"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_uuid)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    bucket: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False, default="fact")
+    source: Mapped[str] = mapped_column(String(64), nullable=False, default="user")
+    pinned: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    legacy_note_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    meta: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSON, default=_empty_dict, nullable=False
+    )
+    created_at: Mapped[str] = mapped_column(String(32), default=utc_now_iso, nullable=False)
+    updated_at: Mapped[str] = mapped_column(
+        String(32), default=utc_now_iso, onupdate=utc_now_iso, nullable=False
+    )
+
+
+class WorkItem(Base):
+    """Executable work primitive."""
+
+    __tablename__ = "work_items"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_uuid)
+    bucket: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    directive: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    fire_at: Mapped[str] = mapped_column(String(32), nullable=False, default="now")
+    recurrence: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
+    tier: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    source: Mapped[str] = mapped_column(String(64), nullable=False, default="user")
+    intent_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    legacy_job_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    visible: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    meta: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSON, default=_empty_dict, nullable=False
+    )
+    created_at: Mapped[str] = mapped_column(String(32), default=utc_now_iso, nullable=False)
+    updated_at: Mapped[str] = mapped_column(
+        String(32), default=utc_now_iso, onupdate=utc_now_iso, nullable=False
+    )
+
+
 ENTITY_TYPES: tuple[type[Base], ...] = (
     Note,
     Aim,
@@ -348,6 +425,9 @@ ENTITY_TYPES: tuple[type[Base], ...] = (
     ChainTemplate,
     ChainRun,
     Attachment,
+    Intent,
+    ContextItem,
+    WorkItem,
 )
 
 ENTITY_BY_NAME: dict[str, type[Base]] = {cls.__name__: cls for cls in ENTITY_TYPES}

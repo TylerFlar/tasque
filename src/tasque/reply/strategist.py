@@ -2,9 +2,8 @@
 
 System prompt = ``prompts/strategist.md`` verbatim. Tools come from the
 tasque MCP injected by the selected upstream (see ``src/tasque/mcp/server.py``).
-There is no post-reply hook: the strategist has no auto-trigger queue.
-A reply does its work synchronously via MCP tool calls, and the next
-scheduled monitoring run picks up shifts on the next cycle.
+A reply does its work synchronously via MCP tool calls. Bucket Aims and
+Signals created during that reply wake the relevant bucket coaches.
 """
 
 from __future__ import annotations
@@ -22,6 +21,7 @@ from tasque.reply.runtime import (
     ReplyResult,
     run_reply,
 )
+from tasque.strategist.graph import STRATEGIST_DISALLOWED_TOOLS
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_STRATEGIST_PROMPT_PATH = _REPO_ROOT / "prompts" / "strategist.md"
@@ -49,10 +49,16 @@ def run_strategist_reply(
 
     ``llm`` defaults to :func:`tasque.llm.factory.get_chat_model("strategist")`.
     ``agent_factory`` is forwarded to the runtime so tests can inject a
-    fake ReAct agent. There is no post-reply hook — replies act
-    synchronously through their tools.
+    fake ReAct agent. Replies act synchronously through their tools.
     """
-    chat = llm if llm is not None else get_chat_model("strategist")
+    chat = (
+        llm
+        if llm is not None
+        else get_chat_model(
+            "strategist",
+            disallowed_tools=STRATEGIST_DISALLOWED_TOOLS,
+        )
+    )
     system_prompt = build_strategist_reply_prompt()
     return run_reply(
         llm=chat,

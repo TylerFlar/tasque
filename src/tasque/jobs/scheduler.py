@@ -10,7 +10,6 @@ Architecture (single global drain):
                                               ├─ run_worker(job)
                                               ├─ on success:
                                               │    mark_completed → schedule_next_if_recurring
-                                              │    coach.trigger.enqueue(bucket, ...)
                                               └─ on failure: dlq.record_failure(job, exc/error)
 
 Key invariants:
@@ -28,9 +27,9 @@ Key invariants:
   QueuedJob with the next fire-at before any failure bookkeeping runs.
   A single bad fire goes into the DLQ but the cron series keeps firing.
   The completed/failed row is left intact for history/auditing.
-- **Coach trigger after success.** Bucketed jobs enqueue a
-  ``coach_pending`` row keyed by ``job:<id>`` so the bucket coach gets
-  one chance to react. Bucketless jobs skip the enqueue.
+- **No implicit continuation.** Standalone worker completion is terminal.
+  The worker-run watcher reports the result; follow-up work should come
+  from an explicit user reply, Aim/Signal, recurrence, or chain step.
 """
 
 from __future__ import annotations
@@ -46,8 +45,6 @@ import structlog
 from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy import select
 
-from tasque.buckets import ALL_BUCKETS, Bucket
-from tasque.coach.trigger import enqueue as _enqueue_coach_trigger
 from tasque.jobs.cron import next_fire_at, to_iso
 from tasque.jobs.dlq import record_failure
 from tasque.jobs.runner import WorkerResult, run_worker
@@ -77,27 +74,6 @@ def _now_iso() -> str:
 
 def _default_worker_runner(job: QueuedJob) -> WorkerResult:
     return run_worker(job)
-
-
-def _default_coach_trigger(bucket: str, job_id: str) -> Any:
-    """Default post-success hook: enqueue a bucket-coach trigger.
-
-    Skips silently if the bucket isn't a known one (e.g. data corruption
-    or a future-bucket name).
-    """
-    if bucket not in ALL_BUCKETS:
-        log.warning(
-            "jobs.scheduler.coach_trigger_skip_unknown_bucket",
-            bucket=bucket,
-            job_id=job_id,
-        )
-        return None
-    typed: Bucket = bucket  # type: ignore[assignment]
-    return _enqueue_coach_trigger(
-        typed,
-        reason=f"job-completed:{job_id}",
-        dedup_key=f"job:{job_id}",
-    )
 
 
 # ----------------------------------------------------------------- claiming
@@ -310,7 +286,7 @@ def claim_and_run_one(
             return None
 
         actual_runner = runner or _default_worker_runner
-        actual_coach = coach_trigger or _default_coach_trigger
+        actual_coach = coach_trigger
 
         stop_event = threading.Event()
         hb_thread = threading.Thread(
@@ -388,7 +364,7 @@ def claim_and_run_one(
         )
         _mark_completed(job.id)
 
-        if job.bucket:
+        if job.bucket and actual_coach is not None:
             try:
                 actual_coach(job.bucket, job.id)
             except Exception:

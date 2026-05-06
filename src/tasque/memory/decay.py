@@ -1,5 +1,11 @@
 """Nondurable-memory decay sweep.
 
+Current policy: Note lifecycle fields (``memory_kind``, ``ttl_days``,
+``canonical_key``) drive cleanup. Worker artifacts, working notes, and
+questions decay quickly; facts, preferences, policies, and canonical
+summaries are curated memory unless they carry a TTL. Archived rows are
+hard-deleted after the configured cutoff by default.
+
 What counts as "nondurable" — and how it decays:
 
 - **Ephemeral Notes** (``durability="ephemeral"``) older than
@@ -42,6 +48,8 @@ class DecayReport:
     counts describe what *would* have been changed."""
 
     archived_ephemeral_notes: int = 0
+    archived_lifecycle_notes: int = 0
+    archived_duplicate_summaries: int = 0
     archived_expired_signals: int = 0
     archived_superseded_notes: int = 0
     hard_deleted_notes: int = 0
@@ -56,6 +64,8 @@ class DecayReport:
     def total_archived(self) -> int:
         return (
             self.archived_ephemeral_notes
+            + self.archived_lifecycle_notes
+            + self.archived_duplicate_summaries
             + self.archived_expired_signals
             + self.archived_superseded_notes
         )
@@ -75,6 +85,39 @@ def _iso_days_ago(days: int) -> str:
 
 def _now_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+_LIFECYCLE_TTL_SETTINGS: dict[str, str] = {
+    "artifact": "decay_artifact_cutoff_days",
+    "working": "decay_working_cutoff_days",
+    "question": "decay_question_cutoff_days",
+}
+
+
+def _note_ttl_days(note: Note, settings: object) -> int | None:
+    if note.ttl_days is not None:
+        return note.ttl_days
+    kind = (note.memory_kind or "").strip().lower()
+    setting_name = _LIFECYCLE_TTL_SETTINGS.get(kind)
+    if setting_name is None:
+        return None
+    return int(getattr(settings, setting_name))
+
+
+def _is_lifecycle_expired(note: Note, settings: object, now: datetime) -> bool:
+    ttl_days = _note_ttl_days(note, settings)
+    if ttl_days is None:
+        return False
+    try:
+        created_raw = note.created_at
+        created = datetime.fromisoformat(
+            created_raw.replace("Z", "+00:00") if created_raw.endswith("Z") else created_raw
+        )
+    except (TypeError, ValueError, AttributeError):
+        return False
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=UTC)
+    return created.astimezone(UTC) < now - timedelta(days=ttl_days)
 
 
 def sweep_nondurable_memory(
@@ -121,6 +164,8 @@ def sweep_nondurable_memory(
     hard_cutoff_iso = _iso_days_ago(eff_hard) if eff_hard is not None else None
 
     n_ephemeral = 0
+    n_lifecycle = 0
+    n_duplicate_summaries = 0
     n_expired = 0
     n_superseded = 0
     n_del_notes = 0
@@ -141,7 +186,45 @@ def sweep_nondurable_memory(
                 row.archived = True
                 row.updated_at = now_iso
 
-        # 2. Archive Signals past their expires_at.
+        # 2. Archive lifecycle-expired Notes. ``ttl_days`` wins when set;
+        # otherwise artifact/working/question use settings defaults.
+        now_dt = datetime.now(UTC)
+        lifecycle_stmt = select(Note).where(Note.archived.is_(False))
+        for row in sess.execute(lifecycle_stmt).scalars().all():
+            if row.archived:
+                continue
+            if not _is_lifecycle_expired(row, s, now_dt):
+                continue
+            n_lifecycle += 1
+            if not dry_run:
+                row.archived = True
+                row.updated_at = now_iso
+
+        # 3. Collapse canonical summaries to the newest active row per
+        #    bucket/key. This makes summaries replace each other instead
+        #    of accumulating.
+        summary_stmt = (
+            select(Note)
+            .where(Note.archived.is_(False))
+            .where(Note.memory_kind == "summary")
+            .where(Note.canonical_key.is_not(None))
+            .order_by(Note.bucket.asc(), Note.canonical_key.asc(), Note.updated_at.desc())
+        )
+        by_key: dict[tuple[str | None, str], list[Note]] = {}
+        for row in sess.execute(summary_stmt).scalars().all():
+            if row.archived:
+                continue
+            if not row.canonical_key:
+                continue
+            by_key.setdefault((row.bucket, row.canonical_key), []).append(row)
+        for rows in by_key.values():
+            for row in rows[1:]:
+                n_duplicate_summaries += 1
+                if not dry_run:
+                    row.archived = True
+                    row.updated_at = now_iso
+
+        # 4. Archive Signals past their expires_at.
         expired_stmt = (
             select(Signal)
             .where(Signal.archived.is_(False))
@@ -154,7 +237,7 @@ def sweep_nondurable_memory(
                 row.archived = True
                 row.updated_at = now_iso
 
-        # 3. Archive superseded Notes whose updated_at is older than the
+        # 5. Archive superseded Notes whose updated_at is older than the
         #    superseded cutoff. The updated_at moves forward when the
         #    supersede happens (see ``supersede_note``), so this is the
         #    right clock — not created_at.
@@ -170,7 +253,7 @@ def sweep_nondurable_memory(
                 row.archived = True
                 row.updated_at = now_iso
 
-        # 4. Optional hard-delete of already-archived rows (Note,
+        # 6. Optional hard-delete of already-archived rows (Note,
         #    Signal, Attachment — the three types with an ``archived``
         #    flag). Skipped entirely when no cutoff is configured.
         if hard_cutoff_iso is not None:
@@ -200,6 +283,8 @@ def sweep_nondurable_memory(
 
     return DecayReport(
         archived_ephemeral_notes=n_ephemeral,
+        archived_lifecycle_notes=n_lifecycle,
+        archived_duplicate_summaries=n_duplicate_summaries,
         archived_expired_signals=n_expired,
         archived_superseded_notes=n_superseded,
         hard_deleted_notes=n_del_notes,

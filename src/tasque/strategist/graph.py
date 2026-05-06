@@ -59,7 +59,7 @@ DEFAULT_RECENT_SIGNAL_LIMIT = 10
 DEFAULT_AIM_PLAN_NOTE_LIMIT = 12
 DEFAULT_AIM_PLAN_SIGNAL_LIMIT = 12
 AIM_CHAIN_PLAN_AGENT_KIND = "aim_chain_plan"
-_AIM_CHAIN_PLAN_DISALLOWED_TOOLS = [
+STRATEGIST_DISALLOWED_TOOLS = [
     "mcp__tasque__aim_plan_chain",
     "mcp__tasque__chain_queue_adhoc",
     "mcp__tasque__chain_fire_template",
@@ -67,6 +67,9 @@ _AIM_CHAIN_PLAN_DISALLOWED_TOOLS = [
     "mcp__tasque__chain_template_update",
     "mcp__tasque__chain_template_delete",
     "mcp__tasque__job_create",
+]
+_AIM_CHAIN_PLAN_DISALLOWED_TOOLS = [
+    *STRATEGIST_DISALLOWED_TOOLS,
 ]
 
 # Sentinel inside a chain step's ``directive`` that flags the worker to
@@ -671,7 +674,10 @@ def _build_prompt(state: StrategistState) -> dict[str, Any]:
 def _call_llm(state: StrategistState) -> dict[str, Any]:
     llm = state.get("llm")
     if llm is None:
-        llm = get_chat_model("strategist")
+        llm = get_chat_model(
+            "strategist",
+            disallowed_tools=STRATEGIST_DISALLOWED_TOOLS,
+        )
     messages = state.get("messages") or []
     llm.invoke(messages)
     # The LLM's text response is intentionally discarded — the
@@ -805,6 +811,7 @@ __all__ = [
     "AIM_CHAIN_PLAN_AGENT_KIND",
     "DEFAULT_HORIZON_DAYS",
     "STRATEGIST_DIRECTIVE_SENTINEL",
+    "STRATEGIST_DISALLOWED_TOOLS",
     "StrategistState",
     "build_graph",
     "plan_chain_for_aim",

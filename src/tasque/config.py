@@ -18,16 +18,23 @@ class Settings(BaseSettings):
     tasque_timezone: str = "UTC"
 
     # --- nondurable-memory decay knobs ---------------------------------
-    # Ephemeral Notes older than this are archived.
-    decay_notes_cutoff_days: int = 30
+    # Ephemeral Notes older than this are archived. More precise lifecycle
+    # fields on Note (memory_kind / ttl_days / canonical_key) now drive most
+    # cleanup; this is the compatibility fallback.
+    decay_notes_cutoff_days: int = 7
+    # Worker/chain artifacts are raw residue, not curated memory.
+    decay_artifact_cutoff_days: int = 3
+    # Working notes and unresolved questions should not linger by default.
+    decay_working_cutoff_days: int = 14
+    decay_question_cutoff_days: int = 14
     # Notes whose ``superseded_by`` was set more than this many days ago
     # get archived — once a chain is established, the older versions are
     # dead weight.
-    decay_superseded_cutoff_days: int = 14
+    decay_superseded_cutoff_days: int = 7
     # If set, rows that have been ``archived=True`` longer than this are
     # hard-deleted. ``None`` means never hard-delete (the default — keep
     # archived rows around for forensic recall and chain integrity).
-    decay_hard_delete_cutoff_days: int | None = None
+    decay_hard_delete_cutoff_days: int | None = 30
     # How often the in-process scheduler runs the sweep.
     decay_sweep_interval_hours: int = 24
 

@@ -57,11 +57,13 @@ def test_run_worker_persists_note_on_success() -> None:
     assert len(notes) == 1
     n = notes[0]
     assert n.content == "Worker introduced itself."
-    assert n.durability == "durable"
+    assert n.durability == "ephemeral"
+    assert n.memory_kind == "artifact"
+    assert n.ttl_days == 3
     assert n.bucket == "personal"
     assert n.meta["directive"] == "introduce yourself"
-    assert n.meta["report"] == "I am tasque worker, hello."
-    assert n.meta["produces"] == {"greeting": "hi"}
+    assert n.meta["report_chars"] == len("I am tasque worker, hello.")
+    assert n.meta["produces_keys"] == ["greeting"]
     assert n.meta["job_id"] == job.id
 
 

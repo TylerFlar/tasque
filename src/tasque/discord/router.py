@@ -32,7 +32,6 @@ import structlog
 from sqlalchemy import select
 
 from tasque.buckets import ALL_BUCKETS, Bucket
-from tasque.coach.trigger import enqueue as enqueue_coach_trigger
 from tasque.discord import poster, threads
 from tasque.memory.db import get_session
 from tasque.memory.entities import ChainRun, Note, QueuedJob
@@ -227,10 +226,10 @@ async def route_message(
 
     ``coach_reply`` defaults to :func:`tasque.reply.coach.run_coach_reply`,
     ``strategist_reply`` to :func:`tasque.reply.strategist.run_strategist_reply`;
-    tests pass fakes to bypass the LLM. ``coach_trigger`` defaults to
-    :func:`tasque.coach.trigger.enqueue` for the post-reply hook (only
-    fired when a bucket coach handles the reply — strategist replies act
-    synchronously through their tools and have no trigger queue).
+    tests pass fakes to bypass the LLM. ``coach_trigger`` is retained as a
+    test seam for older call sites, but replies no longer enqueue a second
+    coach pass; natural follow-up comes from explicit tool work performed
+    during the reply.
     """
     if message.is_bot:
         return RouteResult(skipped=True, reason="bot-author")
@@ -324,21 +323,10 @@ async def route_message(
         posted_ids = await poster.post_long_message(message.channel_id, text)
 
     trigger_id: str | None = None
-    if dest.bucket is not None:
-        trigger_fn: CoachTriggerFn = coach_trigger or enqueue_coach_trigger
-        try:
-            trigger_id = trigger_fn(
-                dest.bucket,
-                "reply",
-                dedup_key=f"reply:{message.message_id}",
-            )
-        except Exception:
-            log.exception(
-                "discord.router.coach_trigger_failed",
-                route=dest.route,
-                bucket=dest.bucket,
-                message_id=message.message_id,
-            )
+    # The synchronous reply path owns this interaction. Any natural
+    # follow-up should happen because that reply created an Aim, Signal,
+    # job, or chain via MCP, not because every message starts a second
+    # background coach pass.
 
     return RouteResult(
         skipped=False,

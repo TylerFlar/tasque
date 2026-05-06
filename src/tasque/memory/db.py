@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Generator
 from contextlib import contextmanager
 from threading import Lock
-from typing import cast
+from typing import Any, cast
 
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import Engine
@@ -101,7 +101,7 @@ def _ensure_schema(engine: Engine) -> None:
 
     Also creates the FTS5 virtual table ``notes_fts`` and the triggers that
     keep it in sync with ``notes``. Existing rows from before FTS5 was added
-    are NOT auto-backfilled — see ``migration/backfill_notes_fts.py``.
+    are NOT auto-backfilled by this bootstrap path.
     """
     Base.metadata.create_all(engine)
     insp = inspect(engine)
@@ -120,7 +120,43 @@ def _ensure_schema(engine: Engine) -> None:
                 conn.execute(
                     text(f'ALTER TABLE "{table.name}" ADD COLUMN "{col.name}" {col_type_sql}')
                 )
+        _ensure_note_lifecycle_defaults(conn)
     _ensure_notes_fts(engine)
+
+
+def _ensure_note_lifecycle_defaults(conn: Any) -> None:
+    """Fill lifecycle fields for rows created before note kinds existed.
+
+    Worker notes are artifacts, behavioral notes are policies, user durable
+    notes are facts, and everything else is working memory unless a caller
+    later promotes it.
+    """
+    try:
+        conn.execute(
+            text(
+                "UPDATE notes "
+                "SET memory_kind = CASE "
+                "  WHEN durability = 'behavioral' THEN 'policy' "
+                "  WHEN source = 'worker' THEN 'artifact' "
+                "  WHEN durability = 'ephemeral' THEN 'working' "
+                "  WHEN durability = 'durable' AND source = 'user' THEN 'fact' "
+                "  ELSE 'working' "
+                "END "
+                "WHERE memory_kind IS NULL OR memory_kind = ''"
+            )
+        )
+        conn.execute(
+            text(
+                "UPDATE notes "
+                "SET ttl_days = 3 "
+                "WHERE source = 'worker' "
+                "  AND memory_kind = 'artifact' "
+                "  AND ttl_days IS NULL"
+            )
+        )
+    except Exception:
+        # Older partially-created test schemas may not have notes yet.
+        return
 
 
 def _ensure_notes_fts(engine: Engine) -> None:

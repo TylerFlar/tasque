@@ -10,8 +10,7 @@ Behaviour:
 
 The runtime knows nothing about Discord, buckets, or coach trigger
 queues. Bindings (e.g. :func:`tasque.reply.coach.run_coach_reply`)
-compose the system prompt, choose the tool set, and decide what — if
-anything — to do as a post-reply side effect.
+compose the system prompt and choose the tool set.
 """
 
 from __future__ import annotations

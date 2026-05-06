@@ -2,9 +2,8 @@
 
 System prompt = ``coach_prompts/<bucket>.md`` + ``prompts/coach_reply_scaffold.md``.
 Tools come from the tasque MCP injected by the selected upstream (see
-``src/tasque/mcp/server.py``). The post-reply hook is wired by the
-Discord router so that a successful reply enqueues a coach trigger
-keyed by the message id (see :func:`tasque.discord.router.route_message`).
+``src/tasque/mcp/server.py``). Replies are synchronous: any natural
+follow-up happens through explicit tool calls made during the reply.
 """
 
 from __future__ import annotations

@@ -27,15 +27,13 @@ def captured_calls(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
     return calls
 
 
-def test_note_create_wakes_target_bucket(captured_calls: list[dict[str, Any]]) -> None:
+def test_note_create_does_not_wake_target_bucket(
+    captured_calls: list[dict[str, Any]],
+) -> None:
     tool_triggers.dispatch_tool_event(
         "note_create", bucket="personal", source="mcp"
     )
-    assert len(captured_calls) == 1
-    call = captured_calls[0]
-    assert call["bucket"] == "personal"
-    assert call["dedup_key"] == "tool:note_create:personal"
-    assert "note_create" in call["reason"]
+    assert captured_calls == []
 
 
 def test_note_create_with_unknown_bucket_is_silent(
@@ -45,13 +43,30 @@ def test_note_create_with_unknown_bucket_is_silent(
     assert captured_calls == []
 
 
-def test_signal_create_wakes_to_bucket_only(captured_calls: list[dict[str, Any]]) -> None:
+def test_signal_create_wakes_to_bucket_only(
+    captured_calls: list[dict[str, Any]],
+) -> None:
     tool_triggers.dispatch_tool_event(
         "signal_create", from_bucket="finance", to_bucket="career"
     )
     assert len(captured_calls) == 1
     assert captured_calls[0]["bucket"] == "career"
     assert captured_calls[0]["dedup_key"] == "tool:signal_create:career"
+
+
+def test_strategist_aim_added_signal_dedups_with_aim_create(
+    captured_calls: list[dict[str, Any]],
+) -> None:
+    tool_triggers.dispatch_tool_event(
+        "signal_create",
+        from_bucket="strategist",
+        to_bucket="relationships",
+        kind="aim_added",
+    )
+    assert len(captured_calls) == 1
+    assert captured_calls[0]["bucket"] == "relationships"
+    assert captured_calls[0]["reason"] == "tool:signal_create:relationships"
+    assert captured_calls[0]["dedup_key"] == "tool:aim_create:relationships"
 
 
 def test_signal_create_broadcast_wakes_all_buckets(
@@ -123,9 +138,8 @@ def test_handler_failure_is_swallowed(monkeypatch: pytest.MonkeyPatch) -> None:
 
 # -------- end-to-end: MCP tool invocation actually reaches the dispatcher
 
-def test_note_create_via_mcp_enqueues_real_coach_trigger() -> None:
-    """Calling ``note_create`` through the FastMCP server writes both
-    a Note row AND a coach_pending row for the target bucket."""
+def test_note_create_via_mcp_does_not_enqueue_coach_trigger() -> None:
+    """Notes are memory edits; they should not start another coach pass."""
     import asyncio
 
     from sqlalchemy import select
@@ -150,10 +164,7 @@ def test_note_create_via_mcp_enqueues_real_coach_trigger() -> None:
 
     assert len(notes) == 1
     assert notes[0].bucket == "career"
-    assert len(pending) == 1
-    assert pending[0].bucket == "career"
-    assert pending[0].dedup_key == "tool:note_create:career"
-    assert pending[0].claimed_at is None
+    assert pending == []
 
 
 def test_signal_create_via_mcp_to_all_enqueues_per_bucket() -> None:
@@ -188,4 +199,3 @@ def test_signal_create_via_mcp_to_all_enqueues_per_bucket() -> None:
     assert len(pending) == len(ALL_BUCKETS)
     woken = {p.bucket for p in pending}
     assert woken == set(ALL_BUCKETS)
-

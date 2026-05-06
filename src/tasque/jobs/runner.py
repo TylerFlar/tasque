@@ -4,9 +4,10 @@ Three linear nodes:
 
     build_prompt → call_llm → persist_run
 
-The worker is intentionally narrow: assemble a prompt, call the small-tier
-LLM, parse a JSON block of ``{report, summary, produces}``, persist a
-``Note(durability=durable, source=worker)`` summarising the run.
+The worker is intentionally narrow: assemble a prompt, call the selected
+LLM tier, read the ``submit_worker_result`` payload, and persist only a
+short-lived artifact Note. The full result stays on the job/chain record;
+curated memory is the coach's job.
 
 Failures are surfaced via ``WorkerResult.error`` rather than raised — the
 scheduler converts an error into a ``FailedJob`` row. The graph itself
@@ -106,6 +107,9 @@ your turn. Pass the bucket from the run context above on each call.
 - **Notes**: ``note_create``, ``note_update``, ``note_supersede``,
   ``note_get``, ``note_list``, ``note_search``, ``note_search_any``,
   ``note_search_fts``, ``note_archive``.
+  Raw worker output is stored by tasque as an artifact. Only write Notes
+  yourself when you are promoting a compact fact/preference/policy/summary
+  that should survive cleanup; set ``memory_kind`` explicitly.
 - **Queued jobs**: ``job_create(directive, bucket, tier, fire_at,
   recurrence, ...)``, ``job_get``, ``job_update``, ``job_cancel``,
   ``job_list``. One-shot (``recurrence=None``) and recurring
@@ -592,12 +596,15 @@ def _persist_run(state: WorkerState) -> dict[str, Any]:
     note = Note(
         content=summary_v,
         bucket=state["job_bucket"],
-        durability="durable",
+        durability="ephemeral",
+        memory_kind="artifact",
+        ttl_days=3,
         source="worker",
         meta={
             "directive": state["job_directive"],
-            "report": report_v,
-            "produces": produces_d,
+            "report_sha256": hashlib.sha256(report_v.encode("utf-8")).hexdigest(),
+            "report_chars": len(report_v),
+            "produces_keys": sorted(str(k) for k in produces_d),
             "job_id": state["job_id"],
             "chain_id": state["job_chain_id"],
             "chain_step_id": state["job_chain_step_id"],

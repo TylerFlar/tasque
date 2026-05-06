@@ -263,16 +263,12 @@ def test_success_with_no_bucket_skips_coach_trigger() -> None:
     assert coach_log == []
 
 
-def test_default_coach_trigger_writes_coach_pending_row() -> None:
-    job = _make_job(directive="real coach hook", bucket="career")
-    # No coach_trigger passed → use default, which calls coach.trigger.enqueue.
+def test_default_success_does_not_wake_bucket_coach() -> None:
+    _make_job(directive="standalone completion", bucket="career")
     claim_and_run_one(runner=_ok_runner(), heartbeat_interval=0.05)
     with get_session() as sess:
         rows = list(sess.execute(select(CoachPending)).scalars().all())
-    assert len(rows) == 1
-    assert rows[0].bucket == "career"
-    assert rows[0].dedup_key == f"job:{job.id}"
-    assert rows[0].reason == f"job-completed:{job.id}"
+    assert rows == []
 
 
 # ---------------------------------------------------------------- failures

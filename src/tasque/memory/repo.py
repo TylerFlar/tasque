@@ -17,11 +17,14 @@ from tasque.memory.entities import (
     Base,
     ChainRun,
     ChainTemplate,
+    ContextItem,
     FailedJob,
+    Intent,
     Note,
     QueuedJob,
     Signal,
     WorkerPattern,
+    WorkItem,
     utc_now_iso,
 )
 
@@ -35,9 +38,18 @@ Entity = (
     | ChainTemplate
     | ChainRun
     | Attachment
+    | Intent
+    | ContextItem
+    | WorkItem
 )
 
 # All concrete entity classes — order matters for stable export and lookup.
+_DEFAULT_NOTE_TTLS_BY_KIND: dict[str, int] = {
+    "artifact": 3,
+    "working": 14,
+    "question": 14,
+}
+
 _ALL_TYPES: tuple[type[Base], ...] = (
     Note,
     Aim,
@@ -48,6 +60,9 @@ _ALL_TYPES: tuple[type[Base], ...] = (
     ChainTemplate,
     ChainRun,
     Attachment,
+    Intent,
+    ContextItem,
+    WorkItem,
 )
 
 # Types that have a single ``bucket`` column suitable for ``query_bucket``.
@@ -60,7 +75,32 @@ _BUCKETED_TYPES: tuple[type[Base], ...] = (
     ChainTemplate,
     ChainRun,
     Attachment,
+    Intent,
+    ContextItem,
+    WorkItem,
 )
+
+
+def _default_note_memory_kind(note: Note) -> str:
+    source = (note.source or "").strip().lower()
+    if note.durability == "behavioral":
+        return "policy"
+    if source == "worker" or source.startswith("chain:"):
+        return "artifact"
+    if note.durability == "ephemeral":
+        return "working"
+    if note.durability == "durable" and source in {"user", "strategist"}:
+        return "fact"
+    return "working"
+
+
+def _apply_note_lifecycle_defaults(entity: Base) -> None:
+    if not isinstance(entity, Note):
+        return
+    if not entity.memory_kind:
+        entity.memory_kind = _default_note_memory_kind(entity)
+    if entity.ttl_days is None:
+        entity.ttl_days = _DEFAULT_NOTE_TTLS_BY_KIND.get(entity.memory_kind)
 
 _WORKER_PATTERN_WORD_RE = re.compile(r"[a-z0-9][a-z0-9_./-]{2,}", re.IGNORECASE)
 _WORKER_PATTERN_STOPWORDS: frozenset[str] = frozenset(
@@ -112,6 +152,7 @@ def write_entity[E: Base](entity: E) -> E:
     UUID id land on the original instance after flush. For existing rows,
     uses ``sess.merge`` to upsert.
     """
+    _apply_note_lifecycle_defaults(entity)
     with get_session() as sess:
         if getattr(entity, "id", None) is None:
             sess.add(entity)
@@ -428,6 +469,9 @@ def supersede_note(old_id: str, new_text: str, *, durability: str) -> Note:
             content=new_text,
             bucket=old.bucket,
             durability=durability,
+            memory_kind=old.memory_kind,
+            ttl_days=old.ttl_days,
+            canonical_key=old.canonical_key,
             source=old.source,
             meta=dict(old.meta or {}),
         )

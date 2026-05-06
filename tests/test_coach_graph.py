@@ -24,7 +24,7 @@ from tasque.coach.graph import (
 )
 from tasque.coach.output import BucketCoachOutput
 from tasque.coach.persist import persist_results
-from tasque.memory.entities import Note, QueuedJob, Signal
+from tasque.memory.entities import Aim, Note, QueuedJob, Signal
 from tasque.memory.repo import write_entity
 
 from .conftest import make_coach_result_chat_model
@@ -44,8 +44,17 @@ def test_bucket_coach_output_defaults_thread_post_to_none() -> None:
 
 # --------------------------------------------------------- gather_context
 
-def test_gather_context_pulls_notes_signals_and_pending_jobs() -> None:
+def test_gather_context_pulls_notes_signals_and_open_jobs() -> None:
     write_entity(Note(content="active", bucket="health", durability="durable", source="user"))
+    write_entity(
+        Aim(
+            title="Run a 5k",
+            bucket="health",
+            scope="bucket",
+            status="active",
+            source="strategist",
+        )
+    )
     archived = write_entity(
         Note(content="gone", bucket="health", durability="durable", source="user", archived=True)
     )
@@ -72,6 +81,15 @@ def test_gather_context_pulls_notes_signals_and_pending_jobs() -> None:
         QueuedJob(
             kind="worker",
             bucket="health",
+            directive="run in progress",
+            queued_by="health",
+            status="claimed",
+        )
+    )
+    write_entity(
+        QueuedJob(
+            kind="worker",
+            bucket="health",
             directive="old",
             queued_by="health",
             status="completed",
@@ -82,9 +100,11 @@ def test_gather_context_pulls_notes_signals_and_pending_jobs() -> None:
     notes = result.get("notes") or []
     signals = result.get("signals") or []
     jobs = result.get("queued_jobs") or []
+    aims = result.get("active_aims") or []
     assert [n.content for n in notes] == ["active"]
+    assert [a.title for a in aims] == ["Run a 5k"]
     assert [s.summary for s in signals] == ["rest more"]
-    assert [j.directive for j in jobs] == ["walk"]
+    assert [j.directive for j in jobs] == ["walk", "run in progress"]
 
 
 # --------------------------------------------------------- build_prompt
@@ -106,6 +126,16 @@ def test_build_prompt_includes_scaffold_bucket_state_and_time(
     # Recent ephemeral notes ARE injected (capped, most-recent first).
     write_entity(
         Note(content="last run noticed dehydration", bucket="health", durability="ephemeral", source="coach")
+    )
+    write_entity(
+        Aim(
+            title="Build a simple conditioning base",
+            bucket="health",
+            scope="bucket",
+            description="Start with one concrete weekly training action.",
+            status="active",
+            source="strategist",
+        )
     )
     write_entity(
         QueuedJob(
@@ -163,6 +193,7 @@ def test_build_prompt_includes_scaffold_bucket_state_and_time(
     # Behavioral instructions and recent ephemeral notes DO appear.
     assert "never auto-text the user" in user_text
     assert "last run noticed dehydration" in user_text
+    assert "Build a simple conditioning base" in user_text
     assert "walk 20 min" in user_text
     assert "Trigger reason: manual ping" in user_text
 
@@ -260,16 +291,15 @@ def test_run_bucket_coach_end_to_end_null_post() -> None:
     assert persisted.get("thread_post") is None
 
 
-# ----------------------------------------------- post-reply tool gating
+# ------------------------------------------- consolidation tool gating
 
-def test_build_prompt_replies_with_post_reply_guidance() -> None:
-    """When fired by the Discord router's post-reply trigger
-    (reason="reply"), the prompt must NOT instruct the bucket coach to
-    fire chains / queue jobs — the synchronous reply already had that
-    chance, and a duplicate fire is the bug we're fixing."""
+def test_build_prompt_replies_with_consolidation_guidance() -> None:
+    """If a caller uses reason="reply", the prompt must NOT instruct the
+    bucket coach to fire chains / queue jobs. The synchronous reply
+    already had that chance."""
     out = _build_prompt({"bucket": "health", "reason": "reply"})
     user_text = str((out["messages"] or [])[1].content)
-    assert "Post-reply pass" in user_text
+    assert "Reply-consolidation pass" in user_text
     assert "synchronous reply" in user_text
     # Disabled action tools must be named so the LLM doesn't try them.
     assert "chain_fire_template" in user_text
@@ -281,15 +311,25 @@ def test_build_prompt_non_reply_keeps_full_action_surface() -> None:
     user_text = str((out["messages"] or [])[1].content)
     # Standard run still tells the coach it can write via MCP.
     assert "note_create" in user_text
-    assert "Post-reply pass" not in user_text
+    assert "job_create" in user_text
+    assert "aim_plan_chain" in user_text
+    assert "Reply-consolidation pass" not in user_text
 
 
-def test_call_llm_passes_disallowed_tools_when_reply_trigger(
+def test_build_prompt_job_completed_is_reaction_only() -> None:
+    out = _build_prompt({"bucket": "health", "reason": "job-completed:abc"})
+    user_text = str((out["messages"] or [])[1].content)
+    assert "Reaction-only pass" in user_text
+    assert "job_create" in user_text
+    assert "disabled for this pass" in user_text
+
+
+def test_call_llm_passes_disallowed_tools_for_reply_reason(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """``run_bucket_coach`` with reason='reply' must build the LLM with
     the chain-fire / queue / job-create tools denylisted, so the
-    proxy → claude --print path can't double-fire on the user's request."""
+    proxy path can't double-fire on the user's request."""
     from langchain_core.messages import AIMessage
 
     from tasque.coach import graph as coach_graph
@@ -309,13 +349,14 @@ def test_call_llm_passes_disallowed_tools_when_reply_trigger(
     coach_graph._call_llm({"bucket": "health", "reason": "reply", "messages": []})
     assert captured["agent_kind"] == "coach"
     assert captured["kwargs"].get("disallowed_tools") == [
+        "mcp__tasque__aim_plan_chain",
         "mcp__tasque__chain_fire_template",
         "mcp__tasque__chain_queue_adhoc",
         "mcp__tasque__job_create",
     ]
 
 
-def test_call_llm_omits_disallowed_tools_for_non_reply_triggers(
+def test_call_llm_disallows_action_tools_for_job_completed_triggers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from langchain_core.messages import AIMessage
@@ -336,4 +377,35 @@ def test_call_llm_omits_disallowed_tools_for_non_reply_triggers(
     coach_graph._call_llm(
         {"bucket": "health", "reason": "job-completed:abc", "messages": []}
     )
-    assert captured["kwargs"].get("disallowed_tools") is None
+    assert captured["kwargs"].get("disallowed_tools") == [
+        "mcp__tasque__aim_plan_chain",
+        "mcp__tasque__chain_fire_template",
+        "mcp__tasque__chain_queue_adhoc",
+        "mcp__tasque__job_create",
+    ]
+
+
+def test_call_llm_disallows_aim_planner_for_scheduled_triggers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from langchain_core.messages import AIMessage
+
+    from tasque.coach import graph as coach_graph
+
+    captured: dict[str, Any] = {}
+
+    class _FakeLLM:
+        def invoke(self, messages: list[Any]) -> AIMessage:
+            return AIMessage(content="{}")
+
+    def fake_factory(agent_kind: str, **kwargs: Any) -> _FakeLLM:
+        captured["kwargs"] = kwargs
+        return _FakeLLM()
+
+    monkeypatch.setattr(coach_graph, "get_chat_model", fake_factory)
+    coach_graph._call_llm(
+        {"bucket": "health", "reason": "scheduled", "messages": []}
+    )
+    assert captured["kwargs"].get("disallowed_tools") == [
+        "mcp__tasque__aim_plan_chain",
+    ]

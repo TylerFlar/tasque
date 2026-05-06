@@ -132,9 +132,8 @@ def get_chat_model(
 
     ``disallowed_tools`` is a per-call denylist forwarded to the tasque
     proxy and on to the selected upstream's tool-deny mechanism. Use it when a
-    call site must not invoke certain MCP tools (e.g. the bucket coach's
-    post-reply trigger excluding chain-fire tools the synchronous reply
-    has already exercised).
+    call site must not invoke certain MCP tools, such as a consolidation-only
+    coach pass that should not start new user-visible work.
     """
     if agent_kind not in ALL_AGENT_KINDS:
         raise ValueError(f"unknown agent kind: {agent_kind!r}")

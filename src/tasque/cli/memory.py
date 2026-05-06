@@ -16,11 +16,14 @@ from tasque.memory.entities import (
     Attachment,
     ChainRun,
     ChainTemplate,
+    ContextItem,
     FailedJob,
+    Intent,
     Note,
     QueuedJob,
     Signal,
     WorkerPattern,
+    WorkItem,
 )
 from tasque.memory.exporters import export_jsonl
 from tasque.memory.importers import import_jsonl, import_markdown_dir
@@ -94,7 +97,7 @@ def cmd_prune(
         typer.Option(
             "--hard-delete-days",
             help="If set, hard-delete archived rows older than this many days. "
-            "Defaults to settings (which defaults to never).",
+            "Defaults to settings.",
         ),
     ] = None,
     dry_run: Annotated[
@@ -102,9 +105,9 @@ def cmd_prune(
         typer.Option("--dry-run", help="Report counts without changing anything."),
     ] = False,
 ) -> None:
-    """Archive expired/decayed nondurable memory: ephemeral Notes,
-    expired Signals, and superseded Notes. Optionally hard-delete
-    long-archived rows. Runs against settings defaults unless overridden."""
+    """Archive decayed lifecycle Notes, expired Signals, superseded Notes,
+    and duplicate canonical summaries. Hard-delete long-archived rows when
+    configured. Runs against settings defaults unless overridden."""
     report = sweep_nondurable_memory(
         notes_cutoff_days=notes_days,
         superseded_cutoff_days=superseded_days,
@@ -131,6 +134,9 @@ def cmd_stats() -> None:
         ChainTemplate,
         ChainRun,
         Attachment,
+        Intent,
+        ContextItem,
+        WorkItem,
     )
     with get_session() as sess:
         for cls in classes:

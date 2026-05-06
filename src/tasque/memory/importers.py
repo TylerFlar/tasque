@@ -24,6 +24,9 @@ from tasque.memory.entities import ENTITY_BY_NAME, Note
 _FIELD_RENAMES: dict[str, dict[str, str]] = {
     "Note": {"metadata": "meta"},
     "WorkerPattern": {"metadata": "meta"},
+    "Intent": {"metadata": "meta"},
+    "ContextItem": {"metadata": "meta"},
+    "WorkItem": {"metadata": "meta"},
 }
 
 
@@ -131,6 +134,7 @@ def import_markdown_dir(path: Path) -> dict[str, Any]:
                 content=content,
                 bucket=bucket,
                 durability="durable",
+                memory_kind="fact",
                 source="user",
                 meta={"path": str(rel).replace("\\", "/")},
             )

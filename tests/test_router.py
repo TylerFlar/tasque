@@ -138,7 +138,7 @@ def _fake_trigger(record: dict[str, Any]) -> Any:
 
 
 @pytest.mark.asyncio
-async def test_route_bucket_message_persists_note_and_enqueues_trigger() -> None:
+async def test_route_bucket_message_persists_note_and_replies_without_trigger_by_default() -> None:
     _bucket_thread()
     poster.set_client(_FakePoster())  # type: ignore[arg-type]
 
@@ -154,7 +154,7 @@ async def test_route_bucket_message_persists_note_and_enqueues_trigger() -> None
     assert result.bucket == "health"
     assert result.reply is not None and result.reply["text"] == "looking ok"
     assert result.posted_message_ids, "router should have posted the reply"
-    assert result.coach_trigger_id == "trigger-1"
+    assert result.coach_trigger_id is None
 
     # Note row created BEFORE the agent call.
     with get_session() as sess:
@@ -166,8 +166,8 @@ async def test_route_bucket_message_persists_note_and_enqueues_trigger() -> None
     assert note.bucket == "health"
     assert note.content == "how is my sleep tracking lately?"
 
-    # Coach trigger keyed by message id with dedup.
-    assert trigger_record["dedup_key"] == "reply:7"
+    # Replies do not start an extra coach pass.
+    assert trigger_record == {}
 
     # Reply binding actually called with the bucket + content.
     assert reply_record["bucket"] == "health"
@@ -293,7 +293,7 @@ async def test_route_per_job_thread_dispatches_to_job_bucket_coach() -> None:
     assert result.route == "queued-job-thread"
     assert result.bucket == "creative"
     assert reply_record["bucket"] == "creative"
-    assert trigger_record["bucket"] == "creative"
+    assert "bucket" not in trigger_record
     # Note carries the route tag so we can audit later.
     with get_session() as sess:
         rows = list(sess.execute(select(Note)).scalars().all())
@@ -338,7 +338,7 @@ async def test_route_per_chain_thread_dispatches_to_chain_bucket_coach() -> None
     assert result.route == "chain-run-thread"
     assert result.bucket == "creative"
     assert reply_record["bucket"] == "creative"
-    assert trigger_record["bucket"] == "creative"
+    assert "bucket" not in trigger_record
     assert run.id  # sanity
 
 

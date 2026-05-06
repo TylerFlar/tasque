@@ -193,9 +193,8 @@ def _extract_disallowed_tools(body: dict[str, Any]) -> list[str] | None:
     both produce the same effect. Claude receives
     ``--disallowedTools <comma-list>``; upstreams without a native deny
     flag receive an instruction in-prompt. Used to gate user-action
-    tools in contexts where the synchronous reply path has already
-    executed the user's request (see the bucket-coach post-reply
-    trigger).
+    tools in contexts that should only consolidate state, not start new
+    user-visible work.
     Returns ``None`` when nothing usable was passed.
     """
     raw = body.get("disallowed_tools")

@@ -94,6 +94,14 @@ _ALL_SIGNAL_FROMS: frozenset[str] = frozenset({*ALL_BUCKETS, "strategist", "syst
 _AIM_CHAIN_DEDUP_SECONDS = 30 * 60
 _AIM_CHAIN_ACTIVE_STATUSES = frozenset({"running", "paused", "awaiting_approval"})
 _AIM_CHAIN_RECENT_TERMINAL_STATUSES = frozenset({"completed", "stopped"})
+_MEMORY_KINDS = frozenset(
+    {"fact", "preference", "policy", "working", "artifact", "summary", "question"}
+)
+_DEFAULT_TTLS_BY_KIND: dict[str, int] = {
+    "artifact": 3,
+    "working": 14,
+    "question": 14,
+}
 
 if TYPE_CHECKING:  # pragma: no cover - imported only for type hints
     from mcp.server.fastmcp import FastMCP
@@ -129,6 +137,56 @@ def _validate_durability(durability: str) -> str | None:
         "durability must be 'ephemeral', 'durable', or 'behavioral', "
         f"got {durability!r}"
     )
+
+
+def _validate_memory_kind(memory_kind: str) -> str | None:
+    if memory_kind in _MEMORY_KINDS:
+        return None
+    return (
+        f"memory_kind must be one of {sorted(_MEMORY_KINDS)!r}, "
+        f"got {memory_kind!r}"
+    )
+
+
+def _normalize_memory_kind(
+    memory_kind: str | None,
+    *,
+    durability: str,
+    source: str,
+) -> str:
+    if memory_kind is not None and memory_kind.strip():
+        return memory_kind.strip().lower()
+    source_value = source.strip().lower()
+    if durability == "behavioral":
+        return "policy"
+    if source_value == "worker" or source_value.startswith("chain:"):
+        return "artifact"
+    if durability == "ephemeral":
+        return "working"
+    if durability == "durable" and source_value in {"user", "strategist"}:
+        return "fact"
+    return "working"
+
+
+def _normalize_ttl_days(ttl_days: int | None, *, memory_kind: str) -> int | None:
+    if ttl_days is not None:
+        return ttl_days
+    return _DEFAULT_TTLS_BY_KIND.get(memory_kind)
+
+
+def _validate_ttl_days(ttl_days: int | None) -> str | None:
+    if ttl_days is None:
+        return None
+    if ttl_days < 0:
+        return "ttl_days must be >= 0 when provided"
+    return None
+
+
+def _normalize_canonical_key(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    return normalized or None
 
 
 def _parse_utc_iso(value: str | None) -> datetime | None:
@@ -233,6 +291,9 @@ def _serialize_note(n: Note, *, truncate: int | None = None) -> dict[str, Any]:
         "content": content,
         "bucket": n.bucket,
         "durability": n.durability,
+        "memory_kind": n.memory_kind,
+        "ttl_days": n.ttl_days,
+        "canonical_key": n.canonical_key,
         "source": n.source,
         "archived": n.archived,
         "superseded_by": n.superseded_by,
@@ -375,23 +436,43 @@ def build_server() -> FastMCP:
         content: str,
         bucket: str,
         durability: str = "ephemeral",
+        memory_kind: str | None = None,
+        ttl_days: int | None = None,
+        canonical_key: str | None = None,
         source: str = "mcp",
         meta: dict[str, Any] | None = None,
     ) -> str:
-        """Write a Note. ``durability`` is "ephemeral" (decays after ~30
-        days), "durable" (long-lived fact), or "behavioral" (always-honor
-        instruction). ``source`` is a short label identifying who wrote
-        it (defaults to "mcp"). Returns the new note id."""
+        """Write a Note.
+
+        ``durability`` remains the broad compatibility class:
+        "ephemeral", "durable", or "behavioral". ``memory_kind`` is the
+        lifecycle class: fact, preference, policy, working, artifact,
+        summary, or question. Artifacts/working/questions decay
+        aggressively by ``ttl_days`` (or their default TTL). Summaries may
+        set ``canonical_key`` so older active summaries for the same key
+        are archived by the memory sweep. Returns the new note id."""
         if not content.strip():
             return _err("content must be a non-empty string")
         if (msg := _validate_bucket(bucket)) is not None:
             return _err(msg)
         if (msg := _validate_durability(durability)) is not None:
             return _err(msg)
+        kind = _normalize_memory_kind(
+            memory_kind,
+            durability=durability,
+            source=source,
+        )
+        if (msg := _validate_memory_kind(kind)) is not None:
+            return _err(msg)
+        if (msg := _validate_ttl_days(ttl_days)) is not None:
+            return _err(msg)
         n = Note(
             content=content,
             bucket=bucket,
             durability=durability,
+            memory_kind=kind,
+            ttl_days=_normalize_ttl_days(ttl_days, memory_kind=kind),
+            canonical_key=_normalize_canonical_key(canonical_key),
             source=source,
             meta=meta or {},
         )
@@ -405,6 +486,9 @@ def build_server() -> FastMCP:
         content: str | None = None,
         bucket: str | None = None,
         durability: str | None = None,
+        memory_kind: str | None = None,
+        ttl_days: int | None = None,
+        canonical_key: str | None = None,
         meta: dict[str, Any] | None = None,
     ) -> str:
         """Patch an existing Note. Only provide fields you intend to
@@ -416,6 +500,9 @@ def build_server() -> FastMCP:
             content is None
             and bucket is None
             and durability is None
+            and memory_kind is None
+            and ttl_days is None
+            and canonical_key is None
             and meta is None
         ):
             return _err("provide at least one field to update")
@@ -424,6 +511,11 @@ def build_server() -> FastMCP:
         if bucket is not None and (msg := _validate_bucket(bucket)) is not None:
             return _err(msg)
         if durability is not None and (msg := _validate_durability(durability)) is not None:
+            return _err(msg)
+        kind_update = memory_kind.strip().lower() if memory_kind is not None else None
+        if kind_update is not None and (msg := _validate_memory_kind(kind_update)) is not None:
+            return _err(msg)
+        if (msg := _validate_ttl_days(ttl_days)) is not None:
             return _err(msg)
         changed_buckets: set[str] = set()
         with get_session() as sess:
@@ -438,6 +530,23 @@ def build_server() -> FastMCP:
                 row.bucket = bucket
             if durability is not None:
                 row.durability = durability
+                if memory_kind is None:
+                    row.memory_kind = _normalize_memory_kind(
+                        None,
+                        durability=row.durability,
+                        source=row.source,
+                    )
+            if kind_update is not None:
+                row.memory_kind = kind_update
+                if ttl_days is None and row.ttl_days is None:
+                    row.ttl_days = _normalize_ttl_days(
+                        None,
+                        memory_kind=kind_update,
+                    )
+            if ttl_days is not None:
+                row.ttl_days = ttl_days
+            if canonical_key is not None:
+                row.canonical_key = _normalize_canonical_key(canonical_key)
             if meta is not None:
                 row.meta = meta
             row.updated_at = utc_now_iso()
@@ -455,6 +564,9 @@ def build_server() -> FastMCP:
         note_id: str,
         content: str,
         durability: str | None = None,
+        memory_kind: str | None = None,
+        ttl_days: int | None = None,
+        canonical_key: str | None = None,
         meta: dict[str, Any] | None = None,
     ) -> str:
         """Replace a Note with a new Note while preserving audit history.
@@ -468,15 +580,39 @@ def build_server() -> FastMCP:
             return _err("content must be a non-empty string")
         if durability is not None and (msg := _validate_durability(durability)) is not None:
             return _err(msg)
+        kind_update = memory_kind.strip().lower() if memory_kind is not None else None
+        if kind_update is not None and (msg := _validate_memory_kind(kind_update)) is not None:
+            return _err(msg)
+        if (msg := _validate_ttl_days(ttl_days)) is not None:
+            return _err(msg)
         changed_bucket: str | None = None
         with get_session() as sess:
             old = sess.get(Note, note_id)
             if old is None:
                 return _err(f"no Note with id={note_id}")
+            new_durability = durability or old.durability
+            new_kind = kind_update or _normalize_memory_kind(
+                old.memory_kind,
+                durability=new_durability,
+                source=old.source,
+            )
             new_note = Note(
                 content=content,
                 bucket=old.bucket,
-                durability=durability or old.durability,
+                durability=new_durability,
+                memory_kind=new_kind,
+                ttl_days=(
+                    ttl_days
+                    if ttl_days is not None
+                    else old.ttl_days
+                    if old.ttl_days is not None
+                    else _normalize_ttl_days(None, memory_kind=new_kind)
+                ),
+                canonical_key=(
+                    _normalize_canonical_key(canonical_key)
+                    if canonical_key is not None
+                    else old.canonical_key
+                ),
                 source=old.source,
                 meta=dict(old.meta or {}) if meta is None else meta,
             )
@@ -517,11 +653,15 @@ def build_server() -> FastMCP:
         intent: str,
         bucket: str,
         durability: str | None = None,
+        memory_kind: str | None = None,
+        include_artifacts: bool = False,
         include_archived: bool = False,
         limit: int = 20,
     ) -> str:
         """List notes in ``bucket`` (newest first). Optional filters:
-        ``durability`` ('ephemeral' / 'durable' / 'behavioral') and
+        ``durability`` ('ephemeral' / 'durable' / 'behavioral'),
+        ``memory_kind`` (fact / preference / policy / working / artifact /
+        summary / question), ``include_artifacts`` (default False), and
         ``include_archived`` (default False). Returns a JSON array.
 
         ``intent`` (required): one short sentence on what you're looking
@@ -529,6 +669,9 @@ def build_server() -> FastMCP:
         if (msg := _validate_bucket(bucket)) is not None:
             return _err(msg)
         if durability is not None and (msg := _validate_durability(durability)) is not None:
+            return _err(msg)
+        kind_filter = memory_kind.strip().lower() if memory_kind is not None else None
+        if kind_filter is not None and (msg := _validate_memory_kind(kind_filter)) is not None:
             return _err(msg)
         if limit < 1:
             return _err("limit must be >= 1")
@@ -538,6 +681,10 @@ def build_server() -> FastMCP:
                 stmt = stmt.where(Note.archived.is_(False))
             if durability is not None:
                 stmt = stmt.where(Note.durability == durability)
+            if kind_filter is not None:
+                stmt = stmt.where(Note.memory_kind == kind_filter)
+            elif not include_artifacts:
+                stmt = stmt.where(or_(Note.memory_kind.is_(None), Note.memory_kind != "artifact"))
             stmt = stmt.order_by(Note.updated_at.desc()).limit(limit)
             rows = list(sess.execute(stmt).scalars().all())
             sess.expunge_all()
@@ -553,6 +700,8 @@ def build_server() -> FastMCP:
         bucket: str,
         query: str,
         durability: str | None = None,
+        memory_kind: str | None = None,
+        include_artifacts: bool = False,
         limit: int = 10,
     ) -> str:
         """Substring search (case-insensitive) over note content within
@@ -565,6 +714,9 @@ def build_server() -> FastMCP:
         if (msg := _validate_bucket(bucket)) is not None:
             return _err(msg)
         if durability is not None and (msg := _validate_durability(durability)) is not None:
+            return _err(msg)
+        kind_filter = memory_kind.strip().lower() if memory_kind is not None else None
+        if kind_filter is not None and (msg := _validate_memory_kind(kind_filter)) is not None:
             return _err(msg)
         if not query.strip():
             return json.dumps([])
@@ -579,6 +731,10 @@ def build_server() -> FastMCP:
             )
             if durability is not None:
                 stmt = stmt.where(Note.durability == durability)
+            if kind_filter is not None:
+                stmt = stmt.where(Note.memory_kind == kind_filter)
+            elif not include_artifacts:
+                stmt = stmt.where(or_(Note.memory_kind.is_(None), Note.memory_kind != "artifact"))
             stmt = stmt.order_by(Note.updated_at.desc()).limit(limit)
             rows = list(sess.execute(stmt).scalars().all())
             sess.expunge_all()
@@ -594,6 +750,8 @@ def build_server() -> FastMCP:
         bucket: str,
         keywords: list[str],
         durability: str | None = None,
+        memory_kind: str | None = None,
+        include_artifacts: bool = False,
         limit: int = 10,
     ) -> str:
         """Like ``note_search`` but matches any keyword (OR-style).
@@ -603,6 +761,9 @@ def build_server() -> FastMCP:
         if (msg := _validate_bucket(bucket)) is not None:
             return _err(msg)
         if durability is not None and (msg := _validate_durability(durability)) is not None:
+            return _err(msg)
+        kind_filter = memory_kind.strip().lower() if memory_kind is not None else None
+        if kind_filter is not None and (msg := _validate_memory_kind(kind_filter)) is not None:
             return _err(msg)
         words = [k.strip() for k in keywords if k.strip()]
         if not words:
@@ -618,6 +779,10 @@ def build_server() -> FastMCP:
             )
             if durability is not None:
                 stmt = stmt.where(Note.durability == durability)
+            if kind_filter is not None:
+                stmt = stmt.where(Note.memory_kind == kind_filter)
+            elif not include_artifacts:
+                stmt = stmt.where(or_(Note.memory_kind.is_(None), Note.memory_kind != "artifact"))
             stmt = stmt.order_by(Note.updated_at.desc()).limit(limit)
             rows = list(sess.execute(stmt).scalars().all())
             sess.expunge_all()
@@ -633,6 +798,8 @@ def build_server() -> FastMCP:
         bucket: str,
         query: str,
         durability: str | None = None,
+        memory_kind: str | None = None,
+        include_artifacts: bool = False,
         limit: int = 10,
     ) -> str:
         """SQLite FTS5 search over note content (BM25-ranked, word-tokenized,
@@ -648,6 +815,9 @@ def build_server() -> FastMCP:
             return _err(msg)
         if durability is not None and (msg := _validate_durability(durability)) is not None:
             return _err(msg)
+        kind_filter = memory_kind.strip().lower() if memory_kind is not None else None
+        if kind_filter is not None and (msg := _validate_memory_kind(kind_filter)) is not None:
+            return _err(msg)
         if not query.strip():
             return json.dumps([])
         if limit < 1:
@@ -655,7 +825,8 @@ def build_server() -> FastMCP:
         params: dict[str, Any] = {"bucket": bucket, "query": query, "limit": limit}
         sql = (
             "SELECT n.id, n.content, n.bucket, n.durability, n.source, "
-            "  n.archived, n.created_at, n.updated_at, n.metadata, n.superseded_by "
+            "  n.archived, n.created_at, n.updated_at, n.metadata, n.superseded_by, "
+            "  n.memory_kind, n.ttl_days, n.canonical_key "
             "FROM notes_fts JOIN notes n ON n.id = notes_fts.note_id "
             "WHERE notes_fts.bucket = :bucket "
             "  AND notes_fts.archived = 0 "
@@ -664,6 +835,11 @@ def build_server() -> FastMCP:
         if durability is not None:
             sql += "  AND notes_fts.durability = :durability "
             params["durability"] = durability
+        if kind_filter is not None:
+            sql += "  AND n.memory_kind = :memory_kind "
+            params["memory_kind"] = kind_filter
+        elif not include_artifacts:
+            sql += "  AND (n.memory_kind IS NULL OR n.memory_kind != 'artifact') "
         sql += "ORDER BY bm25(notes_fts) LIMIT :limit"
         with get_session() as sess:
             try:
@@ -694,6 +870,9 @@ def build_server() -> FastMCP:
                     "updated_at": row[7],
                     "meta": meta,
                     "superseded_by": row[9],
+                    "memory_kind": row[10],
+                    "ttl_days": row[11],
+                    "canonical_key": row[12],
                 }
             )
         return maybe_condense(
@@ -1480,6 +1659,7 @@ def build_server() -> FastMCP:
             "signal_create",
             from_bucket=from_bucket,
             to_bucket=to_bucket,
+            kind=kind,
         )
         return _ok(id=written.id)
 
@@ -1578,8 +1758,10 @@ def build_server() -> FastMCP:
         written = write_entity(a)
         dispatch_tool_event(
             "aim_create",
+            aim_id=written.id,
             bucket=bucket_value,
             scope=scope,
+            source=source,
         )
         return _ok(id=written.id)
 

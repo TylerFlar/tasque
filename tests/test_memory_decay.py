@@ -76,6 +76,81 @@ def test_sweep_leaves_durable_and_behavioral_notes_alone() -> None:
         assert sess.get(Note, behavioral.id).archived is False  # type: ignore[union-attr]
 
 
+# ---------------------------------------------------------- lifecycle notes
+
+def test_sweep_archives_lifecycle_artifacts_by_ttl() -> None:
+    artifact = Note(
+        content="worker residue",
+        bucket="relationships",
+        durability="ephemeral",
+        memory_kind="artifact",
+        ttl_days=3,
+        source="worker",
+    )
+    fact = Note(
+        content="real memory",
+        bucket="relationships",
+        durability="durable",
+        memory_kind="fact",
+        source="user",
+    )
+    write_entity(artifact)
+    write_entity(fact)
+    _backdate(
+        Note,
+        {
+            artifact.id: {"created_at": _iso_days_ago(4)},
+            fact.id: {"created_at": _iso_days_ago(365)},
+        },
+    )
+
+    report = sweep_nondurable_memory()
+    assert report.archived_lifecycle_notes == 1
+
+    with get_session() as sess:
+        assert sess.get(Note, artifact.id).archived is True  # type: ignore[union-attr]
+        assert sess.get(Note, fact.id).archived is False  # type: ignore[union-attr]
+
+
+def test_sweep_collapses_duplicate_canonical_summaries() -> None:
+    older = Note(
+        content="old dating summary",
+        bucket="relationships",
+        durability="durable",
+        memory_kind="summary",
+        canonical_key="relationships:dating",
+        source="coach",
+    )
+    newer = Note(
+        content="new dating summary",
+        bucket="relationships",
+        durability="durable",
+        memory_kind="summary",
+        canonical_key="relationships:dating",
+        source="coach",
+    )
+    other = Note(
+        content="other summary",
+        bucket="relationships",
+        durability="durable",
+        memory_kind="summary",
+        canonical_key="relationships:friends",
+        source="coach",
+    )
+    write_entity(older)
+    write_entity(newer)
+    write_entity(other)
+    _backdate(Note, {older.id: {"updated_at": _iso_days_ago(2)}})
+
+    report = sweep_nondurable_memory()
+    assert report.archived_duplicate_summaries == 1
+
+    with get_session() as sess:
+        assert sess.get(Note, older.id).archived is True  # type: ignore[union-attr]
+        assert sess.get(Note, newer.id).archived is False  # type: ignore[union-attr]
+        assert sess.get(Note, other.id).archived is False  # type: ignore[union-attr]
+
+
 # ---------------------------------------------------------- expired signals
 
 def test_sweep_archives_expired_signals() -> None:
@@ -150,7 +225,7 @@ def test_sweep_leaves_recently_superseded_notes_alone() -> None:
 
 # ------------------------------------------------------------ hard delete
 
-def test_sweep_skips_hard_delete_by_default() -> None:
+def test_sweep_hard_deletes_archived_rows_by_default() -> None:
     archived = Note(
         content="x", durability="durable", source="user", archived=True
     )
@@ -158,9 +233,9 @@ def test_sweep_skips_hard_delete_by_default() -> None:
     _backdate(Note, {archived.id: {"updated_at": _iso_days_ago(365)}})
 
     report = sweep_nondurable_memory()
-    assert report.hard_deleted_notes == 0
+    assert report.hard_deleted_notes == 1
     with get_session() as sess:
-        assert sess.get(Note, archived.id) is not None
+        assert sess.get(Note, archived.id) is None
 
 
 def test_sweep_hard_deletes_when_cutoff_set() -> None:
@@ -214,16 +289,14 @@ def test_sweep_hard_deletes_when_cutoff_set() -> None:
         assert sess.get(Attachment, archived_attach.id) is None
 
 
-def test_sweep_hard_delete_settings_default_is_none() -> None:
-    """``hard_delete_cutoff_days=-1`` (sentinel) means "use settings",
-    and the default setting is None → no deletion."""
+def test_sweep_hard_delete_can_be_disabled() -> None:
     archived = Note(
         content="x", durability="durable", source="user", archived=True
     )
     write_entity(archived)
     _backdate(Note, {archived.id: {"updated_at": _iso_days_ago(10**4)}})
 
-    report = sweep_nondurable_memory(hard_delete_cutoff_days=-1)
+    report = sweep_nondurable_memory(hard_delete_cutoff_days=None)
     assert report.hard_deleted_notes == 0
     with get_session() as sess:
         assert sess.get(Note, archived.id) is not None

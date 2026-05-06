@@ -23,7 +23,7 @@ def _call_tool(name: str, **kwargs: object) -> dict[str, Any] | list[Any]:
     return json.loads(fn(**kwargs))  # type: ignore[operator]
 
 
-def test_note_update_patches_existing_note_and_wakes_bucket() -> None:
+def test_note_update_patches_existing_note_without_waking_bucket() -> None:
     original = Note(
         content="sleep goal is 7 hours",
         bucket="health",
@@ -55,9 +55,66 @@ def test_note_update_patches_existing_note_and_wakes_bucket() -> None:
         assert note.meta == {"confidence": "high"}
         pending = list(sess.execute(select(CoachPending)).scalars().all())
 
-    assert len(pending) == 1
-    assert pending[0].bucket == "health"
-    assert pending[0].dedup_key == "tool:note_update:health"
+    assert pending == []
+
+
+def test_note_create_accepts_lifecycle_fields() -> None:
+    out = _call_tool(
+        "note_create",
+        content="current dating profile needs review",
+        bucket="relationships",
+        durability="durable",
+        memory_kind="summary",
+        ttl_days=21,
+        canonical_key="relationships:dating:state",
+        source="coach",
+    )
+
+    assert out["ok"] is True
+    with get_session() as sess:
+        note = sess.get(Note, out["id"])
+        assert note is not None
+        assert note.memory_kind == "summary"
+        assert note.ttl_days == 21
+        assert note.canonical_key == "relationships:dating:state"
+
+
+def test_note_list_excludes_artifacts_by_default() -> None:
+    artifact = write_entity(
+        Note(
+            content="worker residue",
+            bucket="career",
+            durability="ephemeral",
+            memory_kind="artifact",
+            source="worker",
+        )
+    )
+    fact = write_entity(
+        Note(
+            content="stable fact",
+            bucket="career",
+            durability="durable",
+            memory_kind="fact",
+            source="user",
+        )
+    )
+
+    listed = _call_tool(
+        "note_list",
+        intent="current career memory",
+        bucket="career",
+    )
+    assert isinstance(listed, list)
+    assert [row["id"] for row in listed] == [fact.id]
+
+    with_artifacts = _call_tool(
+        "note_list",
+        intent="career artifacts",
+        bucket="career",
+        include_artifacts=True,
+    )
+    assert isinstance(with_artifacts, list)
+    assert {row["id"] for row in with_artifacts} == {artifact.id, fact.id}
 
 
 def test_note_update_can_move_note_between_buckets() -> None:
@@ -80,11 +137,7 @@ def test_note_update_can_move_note_between_buckets() -> None:
         assert note.bucket == "finance"
         pending = list(sess.execute(select(CoachPending)).scalars().all())
 
-    assert {row.bucket for row in pending} == {"home", "finance"}
-    assert {row.dedup_key for row in pending} == {
-        "tool:note_update:home",
-        "tool:note_update:finance",
-    }
+    assert pending == []
 
 
 def test_note_update_rejects_empty_patch() -> None:
@@ -128,9 +181,7 @@ def test_note_supersede_archives_old_note_and_returns_replacement() -> None:
         assert new_row.archived is False
         pending = list(sess.execute(select(CoachPending)).scalars().all())
 
-    assert len(pending) == 1
-    assert pending[0].bucket == "health"
-    assert pending[0].dedup_key == "tool:note_supersede:health"
+    assert pending == []
 
     listed = _call_tool(
         "note_list",

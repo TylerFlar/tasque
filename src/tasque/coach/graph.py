@@ -33,18 +33,35 @@ from tasque.coach.persist import persist_results
 from tasque.coach.prompts import build_system_prompt
 from tasque.config import get_settings
 from tasque.llm.factory import get_chat_model
-from tasque.memory.entities import Note, QueuedJob, Signal
+from tasque.memory.entities import Aim, Note, QueuedJob, Signal
 from tasque.memory.repo import query_bucket, query_signals_for
 
-# Tools the post-reply bucket-coach pass MUST NOT call: the synchronous
-# Discord reply path (``run_coach_reply``) already had a chance to execute
-# any user-initiated request. Without this gate, both sessions see the
-# user's "please run X" ephemeral note and both fire the chain — observed
-# duplicate-fire on 2026-04-27.
-_REPLY_TRIGGER_DISALLOWED_TOOLS: tuple[str, ...] = (
+# Tools the bucket-coach should not call from background/reactive runs.
+# Aim decomposition is deliberately local to the coach: turn the Aim into
+# one concrete job or a hand-written chain, instead of asking another LLM
+# to synthesize a generic chain plan.
+_ALWAYS_DISALLOWED_TOOLS: tuple[str, ...] = (
+    "mcp__tasque__aim_plan_chain",
+)
+
+# Tools a consolidation-only bucket-coach pass MUST NOT call. The
+# synchronous Discord reply path already had a chance to execute any
+# user-initiated request. Without this gate, a second pass could see the
+# same ephemeral note and duplicate a job or chain.
+_CONSOLIDATION_DISALLOWED_TOOLS: tuple[str, ...] = (
     "mcp__tasque__chain_fire_template",
     "mcp__tasque__chain_queue_adhoc",
     "mcp__tasque__job_create",
+)
+
+# These triggers are bookkeeping reactions, not invitations to start the
+# next worker. Keep them consolidation-only so a completed standalone job
+# cannot chain itself into another near-identical job.
+_REACTION_ONLY_TRIGGER_PREFIXES: tuple[str, ...] = (
+    "job-completed:",
+    "tool:note_create:",
+    "tool:note_update:",
+    "tool:note_supersede:",
 )
 
 if TYPE_CHECKING:
@@ -63,6 +80,7 @@ class BucketCoachState(TypedDict):
     result_token: NotRequired[str]
     llm: NotRequired[BaseChatModel | None]
     notes: NotRequired[list[Note]]
+    active_aims: NotRequired[list[Aim]]
     signals: NotRequired[list[Signal]]
     queued_jobs: NotRequired[list[QueuedJob]]
     messages: NotRequired[list[BaseMessage]]
@@ -75,15 +93,27 @@ class BucketCoachState(TypedDict):
 def _gather_context(state: BucketCoachState) -> dict[str, Any]:
     bucket = state["bucket"]
     rows = query_bucket(bucket)
-    notes = [r for r in rows if isinstance(r, Note) and not r.archived]
-    pending_jobs = [
-        r for r in rows if isinstance(r, QueuedJob) and r.status == "pending"
+    notes = [
+        r
+        for r in rows
+        if isinstance(r, Note)
+        and not r.archived
+        and (r.memory_kind or "") != "artifact"
+    ]
+    active_aims = [
+        r for r in rows if isinstance(r, Aim) and r.status == "active"
+    ]
+    open_jobs = [
+        r
+        for r in rows
+        if isinstance(r, QueuedJob) and r.status in {"pending", "claimed"}
     ]
     signals = query_signals_for(bucket)
     return {
         "notes": notes,
+        "active_aims": active_aims,
         "signals": signals,
-        "queued_jobs": pending_jobs,
+        "queued_jobs": open_jobs,
     }
 
 
@@ -104,7 +134,12 @@ def _format_state_block(state: BucketCoachState) -> str:
 
     notes = state.get("notes") or []
     behavioral = [n for n in notes if n.durability == "behavioral"]
-    durable = [n for n in notes if n.durability == "durable"]
+    durable = [
+        n
+        for n in notes
+        if n.durability == "durable"
+        and (n.memory_kind or "") in {"", "fact", "preference", "policy", "summary"}
+    ]
     ephemeral = sorted(
         (n for n in notes if n.durability == "ephemeral"),
         key=lambda n: n.updated_at,
@@ -118,12 +153,12 @@ def _format_state_block(state: BucketCoachState) -> str:
     else:
         parts.append("### Behavioral instructions\n_(none)_")
 
-    # Durable notes are NOT pre-injected. The bucket has potentially
+    # Curated durable notes are NOT pre-injected. The bucket has potentially
     # hundreds of them; dumping all into every prompt floods the context.
     # Use the note_search_fts / note_search / note_list / note_get MCP tools
     # to pull the specific durable facts relevant to this run's trigger.
     parts.append(
-        f"\n### Durable facts ({len(durable)} present in this bucket)"
+        f"\n### Curated durable memory ({len(durable)} present in this bucket)"
         f"\n_Not pre-injected. Call `note_search_fts(query, durability='durable')` "
         f"or `note_list(durability='durable')` to retrieve specific facts "
         f"relevant to this run._"
@@ -143,6 +178,21 @@ def _format_state_block(state: BucketCoachState) -> str:
     else:
         parts.append("\n### Recent activity\n_(none)_")
 
+    active_aims = sorted(
+        state.get("active_aims") or [],
+        key=lambda a: a.updated_at,
+        reverse=True,
+    )
+    if active_aims:
+        parts.append("\n### Active aims")
+        for a in active_aims[:8]:
+            target = f", target={a.target_date}" if a.target_date else ""
+            parent = f", parent={a.parent_id}" if a.parent_id else ""
+            desc = f" - {_truncate(a.description, 240)}" if a.description else ""
+            parts.append(f"- ({a.id}) {a.title}{target}{parent}{desc}")
+    else:
+        parts.append("\n### Active aims\n_(none)_")
+
     signals = state.get("signals") or []
     if signals:
         parts.append("\n### Signals from other coaches")
@@ -154,10 +204,10 @@ def _format_state_block(state: BucketCoachState) -> str:
     else:
         parts.append("\n### Signals from other coaches\n_(none)_")
 
-    pending_jobs = state.get("queued_jobs") or []
-    if pending_jobs:
+    open_jobs = state.get("queued_jobs") or []
+    if open_jobs:
         parts.append("\n### Open queued jobs")
-        for j in pending_jobs:
+        for j in open_jobs:
             parts.append(
                 f"- ({j.id}) {j.directive} "
                 f"[fire_at={j.fire_at}, status={j.status}]"
@@ -188,6 +238,10 @@ def _format_time_block(reason: str) -> tuple[str, str, str]:
     )
 
 
+def _is_reaction_only_trigger(reason: str) -> bool:
+    return any(reason.startswith(prefix) for prefix in _REACTION_ONLY_TRIGGER_PREFIXES)
+
+
 def _build_prompt(state: BucketCoachState) -> dict[str, Any]:
     bucket = state["bucket"]
     reason = state.get("reason", "")
@@ -199,9 +253,10 @@ def _build_prompt(state: BucketCoachState) -> dict[str, Any]:
     state_block = _format_state_block(state)
     token = state.get("result_token") or result_inbox.mint_token()
     is_post_reply = reason == "reply"
+    is_reaction_only = _is_reaction_only_trigger(reason)
     if is_post_reply:
         action_guidance = (
-            "**Post-reply pass.** The user just received a synchronous reply "
+            "**Reply-consolidation pass.** The user just received a synchronous reply "
             "in this thread; that reply already executed any action the user "
             "asked for. Your job here is consolidation only — note_create, "
             "note_update, note_supersede, note_archive, signal_create, etc. "
@@ -209,11 +264,26 @@ def _build_prompt(state: BucketCoachState) -> dict[str, Any]:
             "(``chain_fire_template``, ``chain_queue_adhoc``, ``job_create``) "
             "are disabled for this pass; do not attempt them."
         )
+    elif is_reaction_only:
+        action_guidance = (
+            "**Reaction-only pass.** This trigger came from bookkeeping "
+            "(for example worker completion or a Note edit). Your job here "
+            "is consolidation only: promote one compact fact/summary if it "
+            "materially improves memory, archive handled Signals if needed, "
+            "or do nothing. The user-action tools "
+            "(``chain_fire_template``, ``chain_queue_adhoc``, ``job_create``) "
+            "are disabled for this pass; do not attempt them."
+        )
     else:
         action_guidance = (
-            "Perform any writes via the tasque MCP now (note_create, "
-            "note_update, note_supersede, job_create, chain_fire_template, "
-            "signal_create, …)."
+            "Perform any writes via the tasque MCP now. For new Aims or "
+            "`aim_added` signals, immediately translate the Aim into one "
+            "concrete `job_create` call, or a small hand-written chain when "
+            "one worker is not enough. Do not call `aim_plan_chain`; do not "
+            "write a strategy essay first. If the Aim is blocked on missing "
+            "user context, ask one concrete question in `thread_post` instead. "
+            "Use `note_create`, `note_update`, and `signal_create` only when "
+            "they materially help."
         )
     user_text = (
         "## Run context\n"
@@ -241,14 +311,12 @@ def _call_llm(state: BucketCoachState) -> dict[str, Any]:
     llm = state.get("llm")
     if llm is None:
         reason = state.get("reason", "") or ""
-        # The Discord router enqueues the post-reply trigger with
-        # ``reason="reply"``. In that path the synchronous reply has
-        # already executed any user-initiated action, so we drop the
-        # corresponding action tools from the bucket-coach turn to
-        # prevent duplicate writes (chain double-fires, duplicate jobs).
-        disallowed: list[str] | None = (
-            list(_REPLY_TRIGGER_DISALLOWED_TOOLS) if reason == "reply" else None
-        )
+        # Reply and bookkeeping triggers are consolidation passes. The
+        # synchronous reply, explicit Aim/Signal path, scheduler, or chain
+        # engine owns starting user-visible work.
+        disallowed = list(_ALWAYS_DISALLOWED_TOOLS)
+        if reason == "reply" or _is_reaction_only_trigger(reason):
+            disallowed.extend(_CONSOLIDATION_DISALLOWED_TOOLS)
         llm = get_chat_model("coach", disallowed_tools=disallowed)
     messages = state.get("messages") or []
     response = llm.invoke(messages)

@@ -188,11 +188,11 @@ def test_persist_results_writes_new_aims_signals_and_status_flips() -> None:
 
 
 def test_run_monitoring_persists_canned_llm_output() -> None:
-    _seed_coach_note("career", "shipped the migration this week")
+    _seed_coach_note("career", "shipped the release this week")
     _seed_coach_note("health", "skipped two workouts this week")
 
     canned = {
-        "summary": "## weekly check-in\n\n- career: shipped migration\n- health: 2 missed workouts",
+        "summary": "## weekly check-in\n\n- career: shipped release\n- health: 2 missed workouts",
         "new_aims": [
             {
                 "title": "weekly cardio floor",

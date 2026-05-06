@@ -16,7 +16,7 @@ You are responding to a user message inside a Discord thread for one of the nine
 
 The host injects the **tasque MCP** into this turn. Pass this bucket's name (the system prompt above identifies it) when a tool needs `bucket`.
 
-- **Notes** — `note_create`, `note_update`, `note_supersede`, `note_get`, `note_list`, `note_search`, `note_search_fts`, `note_search_any`, `note_archive`.
+- **Notes** — `note_create`, `note_update`, `note_supersede`, `note_get`, `note_list`, `note_search`, `note_search_fts`, `note_search_any`, `note_archive`. Use `memory_kind`: `fact`, `preference`, `policy`, `working`, `summary`, or `question`. Avoid storing raw worker artifacts as Notes; promote only compact durable residue. Use `summary` plus `canonical_key` when a note should replace older state.
 - **Queued jobs** — `job_create(directive, bucket, tier, fire_at, recurrence, ...)`, `job_get`, `job_update`, `job_cancel`, `job_list`. Both one-shot and recurring (5-field cron, alias DOW). `tier` is required: `"small"` for trivial nudges, `"medium"` for multi-step tool / scrape / summarize work, `"large"` for agentic planning, code iteration, or deep creative generation.
 - **Chain runs** — `chain_fire_template(name)` to launch a saved template now. `chain_queue_adhoc(plan_json)` for an ad-hoc plan. `chain_run_get`, `chain_run_list`, `chain_run_pause`, `chain_run_resume`, `chain_run_stop`.
 - **Chain templates** — `chain_template_create`, `chain_template_get`, `chain_template_list`, `chain_template_update`, `chain_template_delete`.

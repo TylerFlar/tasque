@@ -1,9 +1,9 @@
-"""Parameterised reply runtime — one ReAct loop, per-agent bindings.
+"""Parameterised reply runtime: one ReAct loop, per-agent bindings.
 
 Two bindings ship: the bucket coach reply and the strategist reply.
-The runtime does not own any per-agent state — callers pass in
-``system_prompt``, ``tools``, and an optional ``post_reply_hook``.
-The strategist binding has no post-reply hook.
+The runtime does not own any per-agent state; callers pass in
+``system_prompt`` and ``tools``. Replies are synchronous; follow-up work
+comes from tool calls made inside the reply turn.
 """
 
 from __future__ import annotations

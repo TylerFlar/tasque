@@ -1,25 +1,31 @@
 # tasque
 
-Single-user task-orchestration daemon. Nine life-area "buckets" (health,
-relationships, education, career, finance, creative, home, personal,
-recreation) each have a coach agent that watches incoming notes and queues
-worker jobs. A strategist sits above the coaches for cross-bucket work.
-Discord is the conversational surface; the CLI is the read interface.
+Single-user task-orchestration daemon for turning abstract intention into
+actionable work, then folding results back into context for the next pass.
+
+The core is intentionally small:
+
+- **Intents**: goals or concepts worth returning to.
+- **WorkItems / QueuedJobs**: explicit next actions with optional schedules.
+- **ChainTemplates / ChainRuns**: reusable multi-step workflows for work that
+  benefits from structure.
+- **ContextItems / Notes**: compact state that should affect future action.
+
+Buckets are metadata for filtering, not independent personalities.
+Coaches, strategist prompts, signals, Discord, and MCP are supporting
+interfaces around the core loop instead of always-on drivers.
 
 ## Architecture in one paragraph
 
-tasque is the orchestration layer around your host's model CLI. Your
-host MCPs (calendar, browser, filesystem, course access, etc.) can plug in
-via Claude or Codex MCP config; the daemon's LLM calls go through
-`tasque proxy`, which wraps the selected upstream CLI as an OpenAI-compat
-endpoint. tasque also ships **its own MCP**
-(`tasque mcp`) you register the same way — that gives every coach,
-worker, and strategist run a live tool catalog for the daemon's own
-state (notes, queued jobs, chain templates, chain runs, signals, aims,
-worker patterns). Memory is SQLite via SQLAlchemy. Job scheduling is
-APScheduler. Multi-step
-workflows ("chains") are LangGraph with the SQLite checkpointer. One
-process, one venv, no Docker.
+tasque is a SQLite memory store plus an explicit work runner. The main loop is:
+capture an intent or context item, queue a concrete job or chain, run it, store
+the result, and let that updated context change the next job. Discord and MCP
+can write state and start explicit work; bucket Aims and Signals wake the
+coach that needs to process them, while ordinary notes and Discord replies do
+not spawn extra background passes. The LLM layer still goes through `tasque
+proxy`, which wraps the selected upstream CLI as an
+OpenAI-compatible endpoint; chains remain LangGraph-backed for structured
+multi-step work.
 
 ## Install
 
@@ -101,9 +107,9 @@ uv run tasque memory import out.jsonl
 # row counts per entity type
 uv run tasque memory stats
 
-# archive ephemeral / superseded / expired rows (and optionally hard-delete
-# long-archived ones). Defaults read from settings; --dry-run reports counts
-# without changing anything.
+# archive decayed lifecycle Notes, superseded Notes, expired Signals, and
+# duplicate canonical summaries; hard-delete long-archived rows when configured.
+# Defaults read from settings; --dry-run reports counts without changing anything.
 uv run tasque memory prune --dry-run
 uv run tasque memory prune --hard-delete-days 90
 ```
@@ -114,9 +120,7 @@ Column additions happen automatically at startup via `_ensure_schema()` —
 new columns get ALTER-ADDed onto existing tables, so adding a field to an
 entity costs nothing. Type changes and column removals go through
 `tasque memory export` → `tasque memory wipe --yes` → `tasque memory
-import`. There is no Alembic-style migration framework; the
-[migration/](migration/) directory holds the one-off scripts and JSONL
-artefacts from past schema reshapes, kept for reference.
+import`.
 
 ## LLM proxy
 
@@ -162,13 +166,11 @@ per-request view with elapsed and idle state).
 `tasque mcp` is a stdio MCP server that exposes the daemon's own state
 (notes, queued jobs, chain templates, chain runs, signals, aims, worker
 patterns) as live tools. Registering it in your host MCP config puts
-those tools in front of every LLM call routed through the proxy — so the
-reactive bucket coach, the chain worker, the planner, and the strategist
-can all fire chains, queue jobs, edit templates, and write notes
-mid-turn. Without it,
-those agents have to encode every action in trailing JSON, which
-collapses for any "do this *now* and observe the result before
-continuing" need.
+those tools in front of every LLM call routed through the proxy, so a
+worker, chain planner, coach, or strategist can explicitly fire chains,
+queue jobs, edit templates, and write notes mid-turn. Notes are just memory
+writes; bucket Aims and Signals wake the relevant coach because they imply
+work to process.
 
 Register it once:
 
@@ -308,13 +310,13 @@ format, time block) lives in [prompts/coach_scaffold.md](prompts/coach_scaffold.
 and is concatenated at request time, so per-bucket files only carry the
 mindset.
 
-The coach is fired exclusively through a single SQLite-backed trigger
-queue. Worker completion, Discord replies, scheduled wakes, and MCP
-tool execution all `enqueue(bucket, reason, dedup_key)`; the drainer
-claims rows serially per bucket and runs the coach LangGraph. The
-MCP-tool source covers cases where another model session (or the user
-via an MCP host) writes a Note, sends a Signal, or creates a
-bucket-scoped Aim through tasque MCP — see
+The coach still runs through a single SQLite-backed trigger queue. Manual
+`tasque coach wake`, scheduled jobs, bucket Aim creation, and Signals can
+enqueue a coach pass. Notes never wake coaches, Discord replies do not create
+a second background pass, and standalone worker completion is terminal: the
+worker-run watcher reports the result, while follow-up work comes from a user
+reply, recurrence, explicit wake, Aim, Signal, or chain step. The MCP-tool
+source covers the selective dispatch; see
 [src/tasque/mcp/tool_triggers.py](src/tasque/mcp/tool_triggers.py)
 for the dispatch table. Dedup is two-phase against
 `(bucket, dedup_key)`:
